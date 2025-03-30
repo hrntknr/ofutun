@@ -384,7 +384,11 @@ func GetAddr() (netip.Addr, error) {
 		if addr.IsLoopback() || addr.IsLinkLocalUnicast() {
 			continue
 		}
-		filtered = append(filtered, addr)
+		if addr4 := addr.To4(); addr4 != nil {
+			filtered = append(filtered, addr4)
+		} else if addr6 := addr.To16(); addr6 != nil {
+			filtered = append(filtered, addr6)
+		}
 	}
 	slices.SortFunc(filtered, func(a, b net.IP) int {
 		ais4 := a.To4()
