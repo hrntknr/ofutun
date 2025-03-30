@@ -32,6 +32,10 @@ func setupNetStack(
 	if err != nil {
 		return nil, err
 	}
+	localDNS := []netip.AddrPort{}
+	for _, ip := range localIP {
+		localDNS = append(localDNS, netip.AddrPortFrom(ip, 53))
+	}
 	s := unsafeGetStack(tnet)
 	ipt := s.IPTables()
 	rules4 := []stack.Rule{}
@@ -39,7 +43,7 @@ func setupNetStack(
 	for _, port := range httpPort {
 		rules4 = append(rules4, stack.Rule{
 			Matchers: []stack.Matcher{
-				&portMatcher{dport: []uint16{port}, cache: cache},
+				&matcher{DPort: []uint16{port}, Cache: cache},
 			},
 			Target: &stack.RedirectTarget{
 				Port:            port,
@@ -48,7 +52,7 @@ func setupNetStack(
 		})
 		rules6 = append(rules6, stack.Rule{
 			Matchers: []stack.Matcher{
-				&portMatcher{dport: []uint16{port}, cache: cache},
+				&matcher{DPort: []uint16{port}, Cache: cache},
 			},
 			Target: &stack.RedirectTarget{
 				Port:            port,
@@ -59,7 +63,7 @@ func setupNetStack(
 	for _, port := range httpsPort {
 		rules4 = append(rules4, stack.Rule{
 			Matchers: []stack.Matcher{
-				&portMatcher{dport: []uint16{port}, cache: cache},
+				&matcher{DPort: []uint16{port}, Cache: cache},
 			},
 			Target: &stack.RedirectTarget{
 				Port:            port,
@@ -68,7 +72,7 @@ func setupNetStack(
 		})
 		rules6 = append(rules6, stack.Rule{
 			Matchers: []stack.Matcher{
-				&portMatcher{dport: []uint16{port}, cache: cache},
+				&matcher{DPort: []uint16{port}, Cache: cache},
 			},
 			Target: &stack.RedirectTarget{
 				Port:            port,
@@ -76,13 +80,13 @@ func setupNetStack(
 			},
 		})
 	}
-	dport := []uint16{53}
+	dport := []uint16{}
 	dport = append(dport, httpPort...)
 	dport = append(dport, httpsPort...)
 	if !disableNonHTTP {
 		rules4 = append(rules4, stack.Rule{
 			Matchers: []stack.Matcher{
-				&portMatcher{dport: dport, not: true, cache: cache},
+				&matcher{DPort: dport, DAddrPort: localDNS, Not: true, Cache: cache},
 			},
 			Target: &stack.RedirectTarget{
 				Port:            1,
@@ -91,7 +95,7 @@ func setupNetStack(
 		})
 		rules6 = append(rules6, stack.Rule{
 			Matchers: []stack.Matcher{
-				&portMatcher{dport: dport, not: true, cache: cache},
+				&matcher{DPort: dport, DAddrPort: localDNS, Not: true, Cache: cache},
 			},
 			Target: &stack.RedirectTarget{
 				Port:            1,
@@ -136,13 +140,14 @@ func unsafeGetStack(tnet *netstack.Net) *stack.Stack {
 	return (*stack.Stack)(unsafe.Pointer(p.UnsafeAddr()))
 }
 
-type portMatcher struct {
-	dport []uint16
-	not   bool
-	cache *flowcache.FlowCache
+type matcher struct {
+	DPort     []uint16
+	DAddrPort []netip.AddrPort
+	Not       bool
+	Cache     *flowcache.FlowCache
 }
 
-func (tm *portMatcher) Match(hook stack.Hook, pkt stack.PacketBufferPtr, _, _ string) (bool, bool) {
+func (tm *matcher) Match(hook stack.Hook, pkt stack.PacketBufferPtr, _, _ string) (bool, bool) {
 	var proto tcpip.TransportProtocolNumber
 	var saddr, daddr tcpip.Address
 	switch pkt.NetworkProtocolNumber {
@@ -190,14 +195,26 @@ func (tm *portMatcher) Match(hook stack.Hook, pkt stack.PacketBufferPtr, _, _ st
 	}
 
 	var action bool
-	if tm.not {
-		action = !slices.Contains(tm.dport, dport)
+	if tm.Not {
+		action = !(slices.Contains(tm.DPort, dport) ||
+			slices.ContainsFunc(tm.DAddrPort, addrPortEq(daddr, dport)))
 	} else {
-		action = slices.Contains(tm.dport, dport)
+		action = slices.Contains(tm.DPort, dport) ||
+			slices.ContainsFunc(tm.DAddrPort, addrPortEq(daddr, dport))
 	}
 	if action {
-		tm.cache.Set(proto, saddr, daddr, sport, dport)
+		tm.Cache.Set(proto, saddr, daddr, sport, dport)
 	}
 
 	return action, false
+}
+
+func addrPortEq(addr tcpip.Address, port uint16) func(netip.AddrPort) bool {
+	return func(a netip.AddrPort) bool {
+		if a.Port() != port {
+			return false
+		}
+		addrS, _ := netip.AddrFromSlice(addr.AsSlice())
+		return a.Addr().Compare(addrS) == 0
+	}
 }
