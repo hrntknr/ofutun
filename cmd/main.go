@@ -120,7 +120,7 @@ func run() error {
 			peers = append(peers, ofutun.Peer{
 				PrivateKey: privateKey,
 				PublicKey:  ofutun.PublicKey(privateKey),
-				IP:         []netip.Addr{netip.MustParseAddr("192.168.0.2")},
+				IP:         []netip.Addr{netip.MustParseAddr("192.168.0.2"), netip.MustParseAddr("fc00::2")},
 			})
 		} else {
 			return fmt.Errorf("at least one peer must be specified")
