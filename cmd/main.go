@@ -20,7 +20,7 @@ var opts struct {
 	PrivateKey     string   `long:"private-key" description:"Base64-encoded private key for the server"`
 	Peer           []string `long:"peer" description:"List of peer public keys and IP addresses in the format <public-key>,<ip1>,<ip2>,..."`
 	PrivPeer       []string `long:"priv-peer" description:"List of peer private keys and IP addresses in the format <private-key>,<ip1>,<ip2>,..."`
-	LocalIP        string   `long:"local-ip" description:"Local IP address to assign to the tunnel interface" default:"192.168.0.1" default:"fc:00:1"`
+	LocalIP        []string `long:"local-ip" description:"Local IP address to assign to the tunnel interface" default:"192.168.0.1" default:"fc00::1"`
 	ListenPort     uint16   `long:"listen-port" short:"l" description:"Port to listen on for incoming connections" default:"51820"`
 	DNSForwarder   []string `long:"dns-forwarder" description:"DNS servers to forward queries to" default:"8.8.8.8" default:"1.1.1.1"`
 	HTTPPorts      []uint16 `long:"http-ports" description:"List of HTTP ports to allow" default:"80"`
@@ -130,9 +130,13 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("failed to parse proxy URL: %w", err)
 	}
-	localIP, err := netip.ParseAddr(opts.LocalIP)
-	if err != nil {
-		return fmt.Errorf("failed to parse local IP address: %w", err)
+	localIP := make([]netip.Addr, len(opts.LocalIP))
+	for i, ipStr := range opts.LocalIP {
+		ip, err := netip.ParseAddr(ipStr)
+		if err != nil {
+			return fmt.Errorf("failed to parse local IP address: %w", err)
+		}
+		localIP[i] = ip
 	}
 	dnsForwarders := make([]netip.Addr, len(opts.DNSForwarder))
 	for i, dns := range opts.DNSForwarder {

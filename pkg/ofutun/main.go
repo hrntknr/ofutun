@@ -42,7 +42,7 @@ type Peer struct {
 	IP         []netip.Addr
 }
 
-func PrintPeerConfigs(endpoint netip.AddrPort, localIP netip.Addr, publicKey []byte, peers []Peer) error {
+func PrintPeerConfigs(endpoint netip.AddrPort, localIP []netip.Addr, publicKey []byte, peers []Peer) error {
 	for n, peer := range peers {
 		fmt.Println("----------- Peer", n+1, "-----------")
 		var privateKey string
@@ -59,11 +59,15 @@ func PrintPeerConfigs(endpoint netip.AddrPort, localIP netip.Addr, publicKey []b
 			}
 			addresses[i] = pfx.String()
 		}
+		local := make([]string, len(localIP))
+		for i, ip := range localIP {
+			local[i] = ip.String()
+		}
 		line := []string{
 			"[Interface]",
 			"PrivateKey = " + privateKey,
 			"Address = " + strings.Join(addresses, ","),
-			"DNS = " + localIP.String(),
+			"DNS = " + strings.Join(local, ","),
 			"MTU = 1420",
 			"",
 			"[Peer]",
@@ -118,7 +122,7 @@ func NewPrivateKey() ([]byte, error) {
 func Run(
 	proxy *url.URL,
 	proxyInsecureSkipVerify bool,
-	endpoint netip.Addr,
+	localIP []netip.Addr,
 	privateKey []byte,
 	listenPort uint16,
 	peers []Peer,
@@ -146,7 +150,7 @@ func Run(
 		}
 	}
 
-	s, err := setupNetStack(endpoint, configs, cache, httpPort, httpsPort, disableNonHTTP)
+	s, err := setupNetStack(localIP, configs, cache, httpPort, httpsPort, disableNonHTTP)
 	if err != nil {
 		return err
 	}
