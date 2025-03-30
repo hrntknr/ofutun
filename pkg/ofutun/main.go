@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"image/color"
 	"io"
@@ -16,8 +17,10 @@ import (
 	"os"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/boombuler/barcode/qr"
+	"github.com/hashicorp/golang-lru/v2/expirable"
 	"github.com/hrntknr/ofutun/pkg/flowcache"
 	"github.com/inconshreveable/go-vhost"
 	"github.com/miekg/dns"
@@ -182,6 +185,11 @@ func Run(
 				panic(err)
 			}
 		}()
+		go func() {
+			if err := setupAnyUDP(s, cache); err != nil {
+				panic(err)
+			}
+		}()
 	}
 
 	log.Info("ofutun started", zap.Uint16("listen_port", listenPort))
@@ -317,6 +325,70 @@ func setupAnyTCP(s *netstack.Net, cache *flowcache.FlowCache) error {
 	}
 }
 
+const udpBufferSize = 65535
+const udpTimeout = 30
+const udpEntrySize = 128
+
+func setupAnyUDP(s *netstack.Net, cache *flowcache.FlowCache) error {
+	anyUDPListener, err := s.ListenUDP(&net.UDPAddr{Port: 1})
+	if err != nil {
+		return err
+	}
+	defer anyUDPListener.Close()
+
+	conns := expirable.NewLRU(udpEntrySize, func(_ [18]byte, c net.Conn) { c.Close() }, udpTimeout*time.Second)
+	buf := make([]byte, udpBufferSize)
+	for {
+		n, saddr, err := anyUDPListener.ReadFrom(buf)
+		if err != nil {
+			return fmt.Errorf("failed to read from UDP: %w", err)
+		}
+		flow := cache.Get(saddr)
+		saddr16 := flow.Saddr.To16()
+		key := [18]byte{
+			saddr16[0], saddr16[1], saddr16[2], saddr16[3],
+			saddr16[4], saddr16[5], saddr16[6], saddr16[7],
+			saddr16[8], saddr16[9], saddr16[10], saddr16[11],
+			saddr16[12], saddr16[13], saddr16[14], saddr16[15],
+			byte(flow.Sport >> 8), byte(flow.Sport),
+		}
+		conn, ok := conns.Get(key)
+		if !ok {
+			target := net.JoinHostPort(flow.Daddr.String(), fmt.Sprintf("%d", flow.Dport))
+			conn, err = net.Dial(flow.Proto, target)
+			if err != nil {
+				log.Warn("failed to dial upstream", zap.Error(err))
+				continue
+			}
+			conns.Add(key, conn)
+			go func(saddr net.Addr, conn net.Conn) {
+				defer conn.Close()
+				buf := make([]byte, udpBufferSize)
+				for {
+					n, err := conn.Read(buf)
+					if err != nil {
+						if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
+							return
+						}
+						log.Warn("failed to read from upstream", zap.Error(err))
+						return
+					}
+					if _, err := anyUDPListener.WriteTo(buf[:n], saddr); err != nil {
+						log.Warn("failed to write to UDP", zap.Error(err))
+						return
+					}
+				}
+			}(saddr, conn)
+		}
+		if _, err := conn.Write(buf[:n]); err != nil {
+			log.Warn("failed to write to upstream", zap.Error(err))
+			conn.Close()
+			conns.Remove(key)
+			continue
+		}
+	}
+}
+
 func setupDNS(s *netstack.Net, dnsForwarders []netip.Addr) error {
 	dnsmux := dns.NewServeMux()
 	dnsmux.HandleFunc(".", func(w dns.ResponseWriter, r *dns.Msg) {
@@ -365,11 +437,19 @@ func pipe(
 	ch := make(chan error, 1)
 	go func() {
 		if _, err := io.Copy(dst1, src1); err != nil {
+			if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
+				ch <- nil
+				return
+			}
 			ch <- err
 		}
 	}()
 	go func() {
 		if _, err := io.Copy(dst2, src2); err != nil {
+			if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
+				ch <- nil
+				return
+			}
 			ch <- err
 		}
 	}()
