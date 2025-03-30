@@ -17,7 +17,7 @@ import (
 )
 
 func setupNetStack(
-	localAddr netip.Addr,
+	localIP []netip.Addr,
 	configs []string,
 	cache *flowcache.FlowCache,
 	httpPort []uint16,
@@ -25,8 +25,8 @@ func setupNetStack(
 	disableNonHTTP bool,
 ) (*netstack.Net, error) {
 	tun, tnet, err := netstack.CreateNetTUN(
-		[]netip.Addr{localAddr},
-		[]netip.Addr{localAddr},
+		localIP,
+		localIP,
 		1420,
 	)
 	if err != nil {
@@ -34,9 +34,10 @@ func setupNetStack(
 	}
 	s := unsafeGetStack(tnet)
 	ipt := s.IPTables()
-	rules := []stack.Rule{}
+	rules4 := []stack.Rule{}
+	rules6 := []stack.Rule{}
 	for _, port := range httpPort {
-		rules = append(rules, stack.Rule{
+		rules4 = append(rules4, stack.Rule{
 			Matchers: []stack.Matcher{
 				&portMatcher{dport: []uint16{port}, cache: cache},
 			},
@@ -45,15 +46,33 @@ func setupNetStack(
 				NetworkProtocol: header.IPv4ProtocolNumber,
 			},
 		})
+		rules6 = append(rules6, stack.Rule{
+			Matchers: []stack.Matcher{
+				&portMatcher{dport: []uint16{port}, cache: cache},
+			},
+			Target: &stack.RedirectTarget{
+				Port:            port,
+				NetworkProtocol: header.IPv6ProtocolNumber,
+			},
+		})
 	}
 	for _, port := range httpsPort {
-		rules = append(rules, stack.Rule{
+		rules4 = append(rules4, stack.Rule{
 			Matchers: []stack.Matcher{
 				&portMatcher{dport: []uint16{port}, cache: cache},
 			},
 			Target: &stack.RedirectTarget{
 				Port:            port,
 				NetworkProtocol: header.IPv4ProtocolNumber,
+			},
+		})
+		rules6 = append(rules6, stack.Rule{
+			Matchers: []stack.Matcher{
+				&portMatcher{dport: []uint16{port}, cache: cache},
+			},
+			Target: &stack.RedirectTarget{
+				Port:            port,
+				NetworkProtocol: header.IPv6ProtocolNumber,
 			},
 		})
 	}
@@ -61,7 +80,7 @@ func setupNetStack(
 	dport = append(dport, httpPort...)
 	dport = append(dport, httpsPort...)
 	if !disableNonHTTP {
-		rules = append(rules, stack.Rule{
+		rules4 = append(rules4, stack.Rule{
 			Matchers: []stack.Matcher{
 				&portMatcher{dport: dport, not: true, cache: cache},
 			},
@@ -70,17 +89,36 @@ func setupNetStack(
 				NetworkProtocol: header.IPv4ProtocolNumber,
 			},
 		})
+		rules6 = append(rules6, stack.Rule{
+			Matchers: []stack.Matcher{
+				&portMatcher{dport: dport, not: true, cache: cache},
+			},
+			Target: &stack.RedirectTarget{
+				Port:            1,
+				NetworkProtocol: header.IPv6ProtocolNumber,
+			},
+		})
 	}
 	ipt.ReplaceTable(stack.NATID, stack.Table{
-		Rules: append(rules, []stack.Rule{
+		Rules: append(rules4, []stack.Rule{
 			{Target: &stack.AcceptTarget{NetworkProtocol: header.IPv4ProtocolNumber}},
 			{Target: &stack.AcceptTarget{NetworkProtocol: header.IPv4ProtocolNumber}},
 			{Target: &stack.AcceptTarget{NetworkProtocol: header.IPv4ProtocolNumber}},
 			{Target: &stack.AcceptTarget{NetworkProtocol: header.IPv4ProtocolNumber}},
 			{Target: &stack.ErrorTarget{NetworkProtocol: header.IPv4ProtocolNumber}},
 		}...),
-		BuiltinChains: [stack.NumHooks]int{0, len(rules) + 1, len(rules) + 2, len(rules) + 3, len(rules) + 4},
+		BuiltinChains: [stack.NumHooks]int{0, len(rules4) + 1, len(rules4) + 2, len(rules4) + 3, len(rules4) + 4},
 	}, false)
+	ipt.ReplaceTable(stack.NATID, stack.Table{
+		Rules: append(rules6, []stack.Rule{
+			{Target: &stack.AcceptTarget{NetworkProtocol: header.IPv6ProtocolNumber}},
+			{Target: &stack.AcceptTarget{NetworkProtocol: header.IPv6ProtocolNumber}},
+			{Target: &stack.AcceptTarget{NetworkProtocol: header.IPv6ProtocolNumber}},
+			{Target: &stack.AcceptTarget{NetworkProtocol: header.IPv6ProtocolNumber}},
+			{Target: &stack.ErrorTarget{NetworkProtocol: header.IPv6ProtocolNumber}},
+		}...),
+		BuiltinChains: [stack.NumHooks]int{0, len(rules6) + 1, len(rules6) + 2, len(rules6) + 3, len(rules6) + 4},
+	}, true)
 
 	dev := device.NewDevice(tun, conn.NewDefaultBind(), device.NewLogger(device.LogLevelError, ""))
 	if err := dev.IpcSet(strings.Join(configs, "\n")); err != nil {

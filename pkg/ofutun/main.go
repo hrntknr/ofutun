@@ -39,10 +39,10 @@ var log *zap.Logger
 type Peer struct {
 	PublicKey  []byte
 	PrivateKey []byte
-	IP         netip.Addr
+	IP         []netip.Addr
 }
 
-func PrintPeerConfigs(endpoint netip.AddrPort, localIP netip.Addr, publicKey []byte, peers []Peer) error {
+func PrintPeerConfigs(endpoint netip.AddrPort, localIP []netip.Addr, publicKey []byte, peers []Peer) error {
 	for n, peer := range peers {
 		fmt.Println("----------- Peer", n+1, "-----------")
 		var privateKey string
@@ -51,16 +51,28 @@ func PrintPeerConfigs(endpoint netip.AddrPort, localIP netip.Addr, publicKey []b
 		} else {
 			privateKey = "{private_key}"
 		}
+		addresses := make([]string, len(peer.IP))
+		for i, ip := range peer.IP {
+			pfx, err := ip.Prefix(ip.BitLen())
+			if err != nil {
+				return fmt.Errorf("failed to get prefix: %w", err)
+			}
+			addresses[i] = pfx.String()
+		}
+		local := make([]string, len(localIP))
+		for i, ip := range localIP {
+			local[i] = ip.String()
+		}
 		line := []string{
 			"[Interface]",
 			"PrivateKey = " + privateKey,
-			"Address = " + peer.IP.String() + "/32",
-			"DNS = " + localIP.String(),
+			"Address = " + strings.Join(addresses, ","),
+			"DNS = " + strings.Join(local, ","),
 			"MTU = 1420",
 			"",
 			"[Peer]",
 			"PublicKey = " + base64.StdEncoding.EncodeToString(publicKey),
-			"AllowedIPs = 0.0.0.0/0",
+			"AllowedIPs = 0.0.0.0/0,::/0",
 			"Endpoint = " + endpoint.String(),
 			"PersistentKeepalive = 25",
 		}
@@ -110,7 +122,7 @@ func NewPrivateKey() ([]byte, error) {
 func Run(
 	proxy *url.URL,
 	proxyInsecureSkipVerify bool,
-	endpoint netip.Addr,
+	localIP []netip.Addr,
 	privateKey []byte,
 	listenPort uint16,
 	peers []Peer,
@@ -128,12 +140,17 @@ func Run(
 		fmt.Sprintf("listen_port=%d", listenPort),
 	}
 	for _, peer := range peers {
-		pfx, _ := peer.IP.Prefix(peer.IP.BitLen())
 		configs = append(configs, fmt.Sprintf("public_key=%s", hex.EncodeToString(peer.PublicKey)))
-		configs = append(configs, fmt.Sprintf("allowed_ip=%s", pfx.String()))
+		for _, ip := range peer.IP {
+			pfx, err := ip.Prefix(ip.BitLen())
+			if err != nil {
+				return fmt.Errorf("failed to get prefix: %w", err)
+			}
+			configs = append(configs, fmt.Sprintf("allowed_ip=%s", pfx.String()))
+		}
 	}
 
-	s, err := setupNetStack(endpoint, configs, cache, httpPort, httpsPort, disableNonHTTP)
+	s, err := setupNetStack(localIP, configs, cache, httpPort, httpsPort, disableNonHTTP)
 	if err != nil {
 		return err
 	}

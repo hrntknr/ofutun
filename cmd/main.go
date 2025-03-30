@@ -18,9 +18,9 @@ var opts struct {
 	Print          bool     `long:"print" short:"p" description:"Print the configuration for the peers"`
 	ProxyInsecure  bool     `long:"proxy-insecure" description:"Ignore TLS certificate errors for the proxy"`
 	PrivateKey     string   `long:"private-key" description:"Base64-encoded private key for the server"`
-	Peer           []string `long:"peer" description:"List of peer public keys and IP addresses in the format <public-key>,<ip>"`
-	PrivPeer       []string `long:"priv-peer" description:"List of peer private keys and IP addresses in the format <private-key>,<ip>"`
-	LocalIP        string   `long:"local-ip" description:"Local IP address to assign to the tunnel interface" default:"192.168.0.1"`
+	Peer           []string `long:"peer" description:"List of peer public keys and IP addresses in the format <public-key>,<ip1>,<ip2>,..."`
+	PrivPeer       []string `long:"priv-peer" description:"List of peer private keys and IP addresses in the format <private-key>,<ip1>,<ip2>,..."`
+	LocalIP        []string `long:"local-ip" description:"Local IP address to assign to the tunnel interface" default:"192.168.0.1" default:"fc00::1"`
 	ListenPort     uint16   `long:"listen-port" short:"l" description:"Port to listen on for incoming connections" default:"51820"`
 	DNSForwarder   []string `long:"dns-forwarder" description:"DNS servers to forward queries to" default:"8.8.8.8" default:"1.1.1.1"`
 	HTTPPorts      []uint16 `long:"http-ports" description:"List of HTTP ports to allow" default:"80"`
@@ -62,8 +62,8 @@ func run() error {
 	peers := make([]ofutun.Peer, len(opts.Peer)+len(opts.PrivPeer))
 	for i, peer := range opts.Peer {
 		parts := strings.Split(peer, ",")
-		if len(parts) != 2 {
-			return fmt.Errorf("invalid peer format: %s, expected <public-key>,<ip>", peer)
+		if len(parts) < 2 {
+			return fmt.Errorf("invalid peer format: %s, <public-key>,<ip1>,<ip2>,... expected", peer)
 		}
 		publicKey, err := base64.StdEncoding.DecodeString(parts[0])
 		if err != nil {
@@ -72,19 +72,23 @@ func run() error {
 		if len(publicKey) != 32 {
 			return fmt.Errorf("invalid public key length: %d, expected 32", len(publicKey))
 		}
-		ip, err := netip.ParseAddr(parts[1])
-		if err != nil {
-			return fmt.Errorf("failed to parse IP address: %w", err)
+		ips := make([]netip.Addr, len(parts)-1)
+		for j, ipStr := range parts[1:] {
+			ip, err := netip.ParseAddr(ipStr)
+			if err != nil {
+				return fmt.Errorf("failed to parse IP address: %w", err)
+			}
+			ips[j] = ip
 		}
 		peers[i] = ofutun.Peer{
 			PublicKey: publicKey,
-			IP:        ip,
+			IP:        ips,
 		}
 	}
 	for i, peer := range opts.PrivPeer {
 		parts := strings.Split(peer, ",")
-		if len(parts) != 2 {
-			return fmt.Errorf("invalid private peer format: %s, expected <private-key>,<ip>", peer)
+		if len(parts) < 2 {
+			return fmt.Errorf("invalid private peer format: %s, <private-key>,<ip1>,<ip2>,... expected", peer)
 		}
 		privateKey, err := base64.StdEncoding.DecodeString(parts[0])
 		if err != nil {
@@ -93,14 +97,18 @@ func run() error {
 		if len(privateKey) != 32 {
 			return fmt.Errorf("invalid private key length: %d, expected 32", len(privateKey))
 		}
-		ip, err := netip.ParseAddr(parts[1])
-		if err != nil {
-			return fmt.Errorf("failed to parse IP address: %w", err)
+		ips := make([]netip.Addr, len(parts)-1)
+		for j, ipStr := range parts[1:] {
+			ip, err := netip.ParseAddr(ipStr)
+			if err != nil {
+				return fmt.Errorf("failed to parse IP address: %w", err)
+			}
+			ips[j] = ip
 		}
 		peers[i+len(opts.Peer)] = ofutun.Peer{
 			PrivateKey: privateKey,
 			PublicKey:  ofutun.PublicKey(privateKey),
-			IP:         ip,
+			IP:         ips,
 		}
 	}
 	if len(peers) == 0 {
@@ -112,7 +120,7 @@ func run() error {
 			peers = append(peers, ofutun.Peer{
 				PrivateKey: privateKey,
 				PublicKey:  ofutun.PublicKey(privateKey),
-				IP:         netip.MustParseAddr("192.168.0.2"),
+				IP:         []netip.Addr{netip.MustParseAddr("192.168.0.2"), netip.MustParseAddr("fc00::2")},
 			})
 		} else {
 			return fmt.Errorf("at least one peer must be specified")
@@ -122,9 +130,13 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("failed to parse proxy URL: %w", err)
 	}
-	localIP, err := netip.ParseAddr(opts.LocalIP)
-	if err != nil {
-		return fmt.Errorf("failed to parse local IP address: %w", err)
+	localIP := make([]netip.Addr, len(opts.LocalIP))
+	for i, ipStr := range opts.LocalIP {
+		ip, err := netip.ParseAddr(ipStr)
+		if err != nil {
+			return fmt.Errorf("failed to parse local IP address: %w", err)
+		}
+		localIP[i] = ip
 	}
 	dnsForwarders := make([]netip.Addr, len(opts.DNSForwarder))
 	for i, dns := range opts.DNSForwarder {
