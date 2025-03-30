@@ -1,14 +1,11 @@
 package main
 
 import (
-	"bytes"
 	"encoding/base64"
 	"fmt"
-	"net"
 	"net/netip"
 	"net/url"
 	"os"
-	"slices"
 	"strings"
 
 	"github.com/hrntknr/ofutun/pkg/ofutun"
@@ -139,31 +136,9 @@ func run() error {
 	}
 
 	if opts.Print {
-		host, err := os.Hostname()
+		addr, err := ofutun.GetAddr()
 		if err != nil {
-			return fmt.Errorf("failed to get hostname: %w", err)
-		}
-		addrs, err := net.LookupIP(host)
-		if err != nil {
-			return fmt.Errorf("failed to lookup IP address: %w", err)
-		}
-		slices.SortFunc(addrs, func(a, b net.IP) int {
-			ais4 := a.To4()
-			bis4 := b.To4()
-			if ais4 != nil && bis4 != nil {
-				return bytes.Compare(ais4, bis4)
-			}
-			if ais4 != nil {
-				return -1
-			}
-			if bis4 != nil {
-				return 1
-			}
-			return bytes.Compare(a, b)
-		})
-		addr, ok := netip.AddrFromSlice(addrs[0])
-		if !ok {
-			return fmt.Errorf("failed to convert IP address to netip.Addr: %w", err)
+			return fmt.Errorf("failed to get local address: %w", err)
 		}
 		addrPort := netip.AddrPortFrom(addr, opts.ListenPort)
 		if err := ofutun.PrintPeerConfigs(addrPort, localIP, ofutun.PublicKey(privateKey), peers); err != nil {

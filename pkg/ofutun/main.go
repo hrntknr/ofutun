@@ -2,6 +2,7 @@ package ofutun
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/hex"
@@ -12,6 +13,8 @@ import (
 	"net/http"
 	"net/netip"
 	"net/url"
+	"os"
+	"slices"
 	"strings"
 
 	"github.com/boombuler/barcode/qr"
@@ -354,4 +357,55 @@ func pipe(
 		}
 	}()
 	return <-ch
+}
+
+func GetAddr() (netip.Addr, error) {
+	host, err := os.Hostname()
+	if err != nil {
+		return netip.Addr{}, fmt.Errorf("failed to get hostname: %w", err)
+	}
+	addrs, err := net.LookupIP(host)
+	if err != nil {
+		_addrs, err := net.InterfaceAddrs()
+		if err != nil {
+			return netip.Addr{}, fmt.Errorf("failed to get interface addresses: %w", err)
+		}
+		addrs = make([]net.IP, len(_addrs))
+		for i, addr := range _addrs {
+			ipnet, ok := addr.(*net.IPNet)
+			if !ok {
+				return netip.Addr{}, fmt.Errorf("failed to convert interface address to IPNet: %w", err)
+			}
+			addrs[i] = ipnet.IP
+		}
+	}
+	var filtered []net.IP
+	for _, addr := range addrs {
+		if addr.IsLoopback() || addr.IsLinkLocalUnicast() {
+			continue
+		}
+		filtered = append(filtered, addr)
+	}
+	slices.SortFunc(filtered, func(a, b net.IP) int {
+		ais4 := a.To4()
+		bis4 := b.To4()
+		if ais4 != nil && bis4 != nil {
+			return bytes.Compare(ais4, bis4)
+		}
+		if ais4 != nil {
+			return -1
+		}
+		if bis4 != nil {
+			return 1
+		}
+		return bytes.Compare(a, b)
+	})
+	if len(filtered) == 0 {
+		return netip.MustParseAddr("127.0.0.1"), nil
+	}
+	addr, ok := netip.AddrFromSlice(filtered[0])
+	if !ok {
+		return netip.Addr{}, fmt.Errorf("failed to convert IP address to netip.Addr: %w", err)
+	}
+	return addr, nil
 }
