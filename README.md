@@ -4,8 +4,8 @@ Convert HTTP/HTTPS proxy to **wireguard+transparent proxy**
 
 ![arch](./arch.drawio.svg)
 
-On mobile devices, Proxy is available only when connected to Wifi.  
-With this tool, you can use proxies regardless of Wifi/mobile connection.
+On mobile devices, Proxy is available only when connected to Wi-Fi.  
+With this tool, you can use proxies regardless of Wi-Fi/mobile connection.
 
 ## Feature
 
