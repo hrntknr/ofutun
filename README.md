@@ -15,7 +15,8 @@ With this tool, you can use proxies regardless of Wi-Fi/mobile connection.
   - (Built-in TCP/IP stack, powered by gvisor)
 
 ## Usage
-```
+
+```sh
 > $ ofutun --help                                 
 Usage:
   ofutun [OPTIONS]
@@ -38,7 +39,9 @@ Application Options:
 Help Options:
   -h, --help              Show this help message
 
-> $ ofutun --proxy http://10.5.1.6:8080 --print --autogen
+> $ ofutun --proxy http://proxy:8080 --print --autogen
+> $ # Docker Example
+> $ docker run -it --rm --net=host ghcr.io/hrntknr/ofutun:main --proxy http://proxy:8080 --print --autogen
 ```
 
 ![screenshot.png](./screenshot.png)
