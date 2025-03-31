@@ -1,6 +1,6 @@
 # ofutun
 
-- **Privilege-free** Wireguard Server
+- **Non-privileged** Wireguard Server
 - (Optional) Convert HTTP/HTTPS proxy to **transparent proxy**
 
 > On mobile devices, Proxy is available only when connected to Wi-Fi.  
@@ -16,7 +16,7 @@
 
 ## Pattern
 
-### Pettern1: As a privilege-free Wireguard Server
+### Pettern1: As a Non-privileged Wireguard Server
 
 ```sh
 $ ./ofutun --print
