@@ -22,7 +22,7 @@ func setupNetStack(
 	cache *flowcache.FlowCache,
 	httpPort []uint16,
 	httpsPort []uint16,
-	disableNonHTTP bool,
+	proxyOnly bool,
 ) (*netstack.Net, error) {
 	tun, tnet, err := netstack.CreateNetTUN(
 		localIP,
@@ -83,7 +83,7 @@ func setupNetStack(
 	dport := []uint16{}
 	dport = append(dport, httpPort...)
 	dport = append(dport, httpsPort...)
-	if !disableNonHTTP {
+	if !proxyOnly {
 		rules4 = append(rules4, stack.Rule{
 			Matchers: []stack.Matcher{
 				&matcher{DPort: dport, DAddrPort: localDNS, Not: true, Cache: cache},
