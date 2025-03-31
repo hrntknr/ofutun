@@ -227,6 +227,9 @@ func setupHTTP(s *netstack.Net, proxyDialer ProxyDialer, port uint16) error {
 				}
 			}
 			if err := req.Write(upstream); err != nil {
+				if checkErr(err) {
+					return
+				}
 				log.Warn("failed to write request", zap.Error(err))
 				return
 			}
@@ -263,18 +266,22 @@ func setupHTTPS(s *netstack.Net, proxyDialer ProxyDialer, port uint16) error {
 				return
 			}
 			target := net.JoinHostPort(tlsConn.Host(), fmt.Sprintf("%d", port))
-			req, err := http.NewRequest("CONNECT", target, nil)
+			req, err := http.NewRequest("CONNECT", "", nil)
 			if err != nil {
 				log.Warn("failed to create request", zap.Error(err))
 				return
 			}
 			req.URL.Opaque = target
+			req.Host = target
 			for k, v := range header {
 				for _, vv := range v {
 					req.Header.Add(k, vv)
 				}
 			}
 			if err := req.Write(upstream); err != nil {
+				if checkErr(err) {
+					return
+				}
 				log.Warn("failed to write request", zap.Error(err))
 				return
 			}
@@ -367,13 +374,16 @@ func setupAnyUDP(s *netstack.Net, cache *flowcache.FlowCache) error {
 				for {
 					n, err := conn.Read(buf)
 					if err != nil {
-						if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
+						if checkErr(err) {
 							return
 						}
 						log.Warn("failed to read from upstream", zap.Error(err))
 						return
 					}
 					if _, err := anyUDPListener.WriteTo(buf[:n], saddr); err != nil {
+						if checkErr(err) {
+							return
+						}
 						log.Warn("failed to write to UDP", zap.Error(err))
 						return
 					}
@@ -381,6 +391,9 @@ func setupAnyUDP(s *netstack.Net, cache *flowcache.FlowCache) error {
 			}(saddr, conn)
 		}
 		if _, err := conn.Write(buf[:n]); err != nil {
+			if checkErr(err) {
+				continue
+			}
 			log.Warn("failed to write to upstream", zap.Error(err))
 			conn.Close()
 			conns.Remove(key)
@@ -437,7 +450,7 @@ func pipe(
 	ch := make(chan error, 1)
 	go func() {
 		if _, err := io.Copy(dst1, src1); err != nil {
-			if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
+			if checkErr(err) {
 				ch <- nil
 				return
 			}
@@ -446,7 +459,7 @@ func pipe(
 	}()
 	go func() {
 		if _, err := io.Copy(dst2, src2); err != nil {
-			if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
+			if checkErr(err) {
 				ch <- nil
 				return
 			}
@@ -509,4 +522,11 @@ func GetAddr() (netip.Addr, error) {
 		return netip.Addr{}, fmt.Errorf("failed to convert IP address to netip.Addr: %w", err)
 	}
 	return addr, nil
+}
+
+func checkErr(err error) bool {
+	if _, ok := err.(*net.OpError); ok {
+		return true
+	}
+	return errors.Is(err, io.EOF)
 }
