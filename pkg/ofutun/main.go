@@ -29,16 +29,6 @@ import (
 	"golang.zx2c4.com/wireguard/tun/netstack"
 )
 
-func init() {
-	var err error
-	log, err = zap.NewDevelopment()
-	if err != nil {
-		panic(err)
-	}
-}
-
-var log *zap.Logger
-
 type Peer struct {
 	PublicKey  []byte
 	PrivateKey []byte
@@ -123,6 +113,7 @@ func NewPrivateKey() ([]byte, error) {
 }
 
 func Run(
+	log *zap.Logger,
 	proxy *url.URL,
 	proxyInsecureSkipVerify bool,
 	localIP []netip.Addr,
@@ -132,7 +123,7 @@ func Run(
 	dnsForwarders []netip.Addr,
 	httpPort []uint16,
 	httpsPort []uint16,
-	disableNonHTTP bool,
+	ProxyOnly bool,
 ) error {
 	cache, err := flowcache.NewFlowCache()
 	if err != nil {
@@ -153,40 +144,42 @@ func Run(
 		}
 	}
 
-	s, err := setupNetStack(localIP, configs, cache, httpPort, httpsPort, disableNonHTTP)
+	s, err := setupNetStack(localIP, configs, cache, httpPort, httpsPort, ProxyOnly)
 	if err != nil {
 		return err
 	}
 
-	proxyDialer := NewProxyDialer(proxy, proxyInsecureSkipVerify)
 	// todo: gracefully shutdown
-	go func() {
-		if err := setupDNS(s, dnsForwarders); err != nil {
-			panic(err)
-		}
-	}()
-	for _, port := range httpPort {
-		go func(p uint16) {
-			if err := setupHTTP(s, proxyDialer, p); err != nil {
-				panic(err)
-			}
-		}(port)
-	}
-	for _, port := range httpsPort {
-		go func(p uint16) {
-			if err := setupHTTPS(s, proxyDialer, p); err != nil {
-				panic(err)
-			}
-		}(port)
-	}
-	if !disableNonHTTP {
+	if proxy != nil {
+		proxyDialer := NewProxyDialer(proxy, proxyInsecureSkipVerify)
 		go func() {
-			if err := setupAnyTCP(s, cache); err != nil {
+			if err := setupDNS(log, s, dnsForwarders); err != nil {
+				panic(err)
+			}
+		}()
+		for _, port := range httpPort {
+			go func(p uint16) {
+				if err := setupHTTP(log, s, proxyDialer, p); err != nil {
+					panic(err)
+				}
+			}(port)
+		}
+		for _, port := range httpsPort {
+			go func(p uint16) {
+				if err := setupHTTPS(log, s, proxyDialer, p); err != nil {
+					panic(err)
+				}
+			}(port)
+		}
+	}
+	if !ProxyOnly {
+		go func() {
+			if err := setupAnyTCP(log, s, cache); err != nil {
 				panic(err)
 			}
 		}()
 		go func() {
-			if err := setupAnyUDP(s, cache); err != nil {
+			if err := setupAnyUDP(log, s, cache); err != nil {
 				panic(err)
 			}
 		}()
@@ -196,7 +189,7 @@ func Run(
 	select {}
 }
 
-func setupHTTP(s *netstack.Net, proxyDialer ProxyDialer, port uint16) error {
+func setupHTTP(log *zap.Logger, s *netstack.Net, proxyDialer ProxyDialer, port uint16) error {
 	httpListener, err := s.ListenTCP(&net.TCPAddr{Port: int(port)})
 	if err != nil {
 		return err
@@ -241,7 +234,7 @@ func setupHTTP(s *netstack.Net, proxyDialer ProxyDialer, port uint16) error {
 	}
 }
 
-func setupHTTPS(s *netstack.Net, proxyDialer ProxyDialer, port uint16) error {
+func setupHTTPS(log *zap.Logger, s *netstack.Net, proxyDialer ProxyDialer, port uint16) error {
 	httpsListener, err := s.ListenTCP(&net.TCPAddr{Port: int(port)})
 	if err != nil {
 		return err
@@ -303,7 +296,7 @@ func setupHTTPS(s *netstack.Net, proxyDialer ProxyDialer, port uint16) error {
 	}
 }
 
-func setupAnyTCP(s *netstack.Net, cache *flowcache.FlowCache) error {
+func setupAnyTCP(log *zap.Logger, s *netstack.Net, cache *flowcache.FlowCache) error {
 	anyTCPListener, err := s.ListenTCP(&net.TCPAddr{Port: 1})
 	if err != nil {
 		return err
@@ -336,7 +329,7 @@ const udpBufferSize = 65535
 const udpTimeout = 30
 const udpEntrySize = 128
 
-func setupAnyUDP(s *netstack.Net, cache *flowcache.FlowCache) error {
+func setupAnyUDP(log *zap.Logger, s *netstack.Net, cache *flowcache.FlowCache) error {
 	anyUDPListener, err := s.ListenUDP(&net.UDPAddr{Port: 1})
 	if err != nil {
 		return err
@@ -402,7 +395,7 @@ func setupAnyUDP(s *netstack.Net, cache *flowcache.FlowCache) error {
 	}
 }
 
-func setupDNS(s *netstack.Net, dnsForwarders []netip.Addr) error {
+func setupDNS(_ *zap.Logger, s *netstack.Net, dnsForwarders []netip.Addr) error {
 	dnsmux := dns.NewServeMux()
 	dnsmux.HandleFunc(".", func(w dns.ResponseWriter, r *dns.Msg) {
 		for _, forwarder := range dnsForwarders {

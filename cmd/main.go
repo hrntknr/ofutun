@@ -10,22 +10,32 @@ import (
 
 	"github.com/hrntknr/ofutun/pkg/ofutun"
 	"github.com/jessevdk/go-flags"
+	"go.uber.org/zap"
 )
 
+func init() {
+	var err error
+	log, err = zap.NewDevelopment()
+	if err != nil {
+		panic(err)
+	}
+}
+
+var log *zap.Logger
+
 var opts struct {
-	Proxy          string   `long:"proxy" required:"true" description:"Proxy address to use for tunneling"`
-	AutoGen        bool     `long:"autogen" short:"a" description:"Automatically generate a private key and public key for the server"`
-	Print          bool     `long:"print" short:"p" description:"Print the configuration for the peers"`
-	ProxyInsecure  bool     `long:"proxy-insecure" description:"Ignore TLS certificate errors for the proxy"`
-	PrivateKey     string   `long:"private-key" description:"Base64-encoded private key for the server"`
-	Peer           []string `long:"peer" description:"List of peer public keys and IP addresses in the format <public-key>,<ip1>,<ip2>,..."`
-	PrivPeer       []string `long:"priv-peer" description:"List of peer private keys and IP addresses in the format <private-key>,<ip1>,<ip2>,..."`
-	LocalIP        []string `long:"local-ip" description:"Local IP address to assign to the tunnel interface" default:"192.168.0.1" default:"fc00::1"`
-	ListenPort     uint16   `long:"listen-port" short:"l" description:"Port to listen on for incoming connections" default:"51820"`
-	DNSForwarder   []string `long:"dns-forwarder" description:"DNS servers to forward queries to" default:"8.8.8.8" default:"1.1.1.1"`
-	HTTPPorts      []uint16 `long:"http-ports" description:"List of HTTP ports to allow" default:"80"`
-	HTTPSPorts     []uint16 `long:"https-ports" description:"List of HTTPS ports to allow" default:"443"`
-	DisableNonHTTP bool     `long:"disable-non-http" description:"Disable non-HTTP/HTTPS traffic"`
+	Print         bool     `long:"print" short:"p" description:"Print the configuration for the peers"`
+	PrivateKey    string   `long:"private-key" description:"Base64-encoded private key for the server"`
+	Peer          []string `long:"peer" description:"List of peer public keys and IP addresses in the format <public-key>,<ip1>,<ip2>,..."`
+	PrivPeer      []string `long:"priv-peer" description:"List of peer private keys and IP addresses in the format <private-key>,<ip1>,<ip2>,..."`
+	LocalIP       []string `long:"local-ip" description:"Local IP address to assign to the tunnel interface" default:"192.168.0.1" default:"fc00::1"`
+	ListenPort    uint16   `long:"listen-port" short:"l" description:"Port to listen on for incoming connections" default:"51820"`
+	DNSForwarder  []string `long:"dns-forwarder" description:"DNS servers to forward queries to" default:"8.8.8.8" default:"1.1.1.1"`
+	Proxy         *string  `long:"proxy" description:"Proxy address to use for tunneling"`
+	ProxyInsecure bool     `long:"proxy-insecure" description:"Ignore TLS certificate errors for the proxy"`
+	ProxyOnly     bool     `long:"proxy-only" description:"Only allow traffic to the proxy"`
+	HTTPPorts     []uint16 `long:"http-ports" description:"List of HTTP ports to allow" default:"80"`
+	HTTPSPorts    []uint16 `long:"https-ports" description:"List of HTTPS ports to allow" default:"443"`
 }
 
 func main() {
@@ -40,6 +50,9 @@ func main() {
 }
 
 func run() error {
+	if opts.ProxyOnly && opts.Proxy == nil {
+		return fmt.Errorf("proxy must be specified when --only-proxy is set")
+	}
 	var privateKey []byte
 	if opts.PrivateKey != "" {
 		_privateKey, err := base64.StdEncoding.DecodeString(opts.PrivateKey)
@@ -47,14 +60,13 @@ func run() error {
 			return fmt.Errorf("failed to decode private key: %w", err)
 		}
 		privateKey = _privateKey
-	} else if opts.AutoGen {
+	} else {
 		_privateKey, err := ofutun.NewPrivateKey()
 		if err != nil {
 			return fmt.Errorf("failed to generate private key: %w", err)
 		}
+		log.Info("generated server key", zap.String("public-key", base64.StdEncoding.EncodeToString(ofutun.PublicKey(_privateKey))))
 		privateKey = _privateKey
-	} else {
-		return fmt.Errorf("either --private-key or --autogen must be specified")
 	}
 	if len(privateKey) != 32 {
 		return fmt.Errorf("invalid private key length: %d, expected 32", len(privateKey))
@@ -112,23 +124,27 @@ func run() error {
 		}
 	}
 	if len(peers) == 0 {
-		if opts.AutoGen {
-			privateKey, err := ofutun.NewPrivateKey()
-			if err != nil {
-				return fmt.Errorf("failed to generate private key: %w", err)
-			}
-			peers = append(peers, ofutun.Peer{
-				PrivateKey: privateKey,
-				PublicKey:  ofutun.PublicKey(privateKey),
-				IP:         []netip.Addr{netip.MustParseAddr("192.168.0.2"), netip.MustParseAddr("fc00::2")},
-			})
-		} else {
-			return fmt.Errorf("at least one peer must be specified")
+		privateKey, err := ofutun.NewPrivateKey()
+		if err != nil {
+			return fmt.Errorf("failed to generate private key: %w", err)
 		}
+		peers = append(peers, ofutun.Peer{
+			PrivateKey: privateKey,
+			PublicKey:  ofutun.PublicKey(privateKey),
+			IP:         []netip.Addr{netip.MustParseAddr("192.168.0.2"), netip.MustParseAddr("fc00::2")},
+		})
+		log.Info("generated peer",
+			zap.String("private-key", base64.StdEncoding.EncodeToString(privateKey)),
+			zap.Strings("address", []string{"192.168.0.2", "fc00::2"}),
+		)
 	}
-	proxy, err := url.Parse(opts.Proxy)
-	if err != nil {
-		return fmt.Errorf("failed to parse proxy URL: %w", err)
+	var proxy *url.URL
+	if opts.Proxy != nil {
+		_proxy, err := url.Parse(*opts.Proxy)
+		if err != nil {
+			return fmt.Errorf("failed to parse proxy URL: %w", err)
+		}
+		proxy = _proxy
 	}
 	localIP := make([]netip.Addr, len(opts.LocalIP))
 	for i, ipStr := range opts.LocalIP {
@@ -159,6 +175,7 @@ func run() error {
 	}
 
 	if err := ofutun.Run(
+		log,
 		proxy,
 		opts.ProxyInsecure,
 		localIP,
@@ -168,7 +185,7 @@ func run() error {
 		dnsForwarders,
 		opts.HTTPPorts,
 		opts.HTTPSPorts,
-		opts.DisableNonHTTP,
+		opts.ProxyOnly,
 	); err != nil {
 		return fmt.Errorf("failed to run ofutun: %w", err)
 	}
