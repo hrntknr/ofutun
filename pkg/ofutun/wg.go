@@ -1,7 +1,9 @@
 package ofutun
 
 import (
+	"net"
 	"net/netip"
+	"net/url"
 	"reflect"
 	"slices"
 	"strings"
@@ -20,17 +22,18 @@ func setupNetStack(
 	localIP []netip.Addr,
 	configs []string,
 	cache *flowcache.FlowCache,
+	proxy *url.URL,
 	httpPort []uint16,
 	httpsPort []uint16,
 	proxyOnly bool,
-) (*netstack.Net, error) {
+) (*netstack.Net, *device.Device, error) {
 	tun, tnet, err := netstack.CreateNetTUN(
 		localIP,
 		localIP,
 		1420,
 	)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	localDNS := []netip.AddrPort{}
 	for _, ip := range localIP {
@@ -40,49 +43,53 @@ func setupNetStack(
 	ipt := s.IPTables()
 	rules4 := []stack.Rule{}
 	rules6 := []stack.Rule{}
-	for _, port := range httpPort {
-		rules4 = append(rules4, stack.Rule{
-			Matchers: []stack.Matcher{
-				&matcher{DPort: []uint16{port}, Cache: cache},
-			},
-			Target: &stack.RedirectTarget{
-				Port:            port,
-				NetworkProtocol: header.IPv4ProtocolNumber,
-			},
-		})
-		rules6 = append(rules6, stack.Rule{
-			Matchers: []stack.Matcher{
-				&matcher{DPort: []uint16{port}, Cache: cache},
-			},
-			Target: &stack.RedirectTarget{
-				Port:            port,
-				NetworkProtocol: header.IPv6ProtocolNumber,
-			},
-		})
-	}
-	for _, port := range httpsPort {
-		rules4 = append(rules4, stack.Rule{
-			Matchers: []stack.Matcher{
-				&matcher{DPort: []uint16{port}, Cache: cache},
-			},
-			Target: &stack.RedirectTarget{
-				Port:            port,
-				NetworkProtocol: header.IPv4ProtocolNumber,
-			},
-		})
-		rules6 = append(rules6, stack.Rule{
-			Matchers: []stack.Matcher{
-				&matcher{DPort: []uint16{port}, Cache: cache},
-			},
-			Target: &stack.RedirectTarget{
-				Port:            port,
-				NetworkProtocol: header.IPv6ProtocolNumber,
-			},
-		})
+	if proxy != nil {
+		for _, port := range httpPort {
+			rules4 = append(rules4, stack.Rule{
+				Matchers: []stack.Matcher{
+					&matcher{DPort: []uint16{port}, Cache: cache},
+				},
+				Target: &stack.RedirectTarget{
+					Port:            port,
+					NetworkProtocol: header.IPv4ProtocolNumber,
+				},
+			})
+			rules6 = append(rules6, stack.Rule{
+				Matchers: []stack.Matcher{
+					&matcher{DPort: []uint16{port}, Cache: cache},
+				},
+				Target: &stack.RedirectTarget{
+					Port:            port,
+					NetworkProtocol: header.IPv6ProtocolNumber,
+				},
+			})
+		}
+		for _, port := range httpsPort {
+			rules4 = append(rules4, stack.Rule{
+				Matchers: []stack.Matcher{
+					&matcher{DPort: []uint16{port}, Cache: cache},
+				},
+				Target: &stack.RedirectTarget{
+					Port:            port,
+					NetworkProtocol: header.IPv4ProtocolNumber,
+				},
+			})
+			rules6 = append(rules6, stack.Rule{
+				Matchers: []stack.Matcher{
+					&matcher{DPort: []uint16{port}, Cache: cache},
+				},
+				Target: &stack.RedirectTarget{
+					Port:            port,
+					NetworkProtocol: header.IPv6ProtocolNumber,
+				},
+			})
+		}
 	}
 	dport := []uint16{}
-	dport = append(dport, httpPort...)
-	dport = append(dport, httpsPort...)
+	if proxy != nil {
+		dport = append(dport, httpPort...)
+		dport = append(dport, httpsPort...)
+	}
 	if !proxyOnly {
 		rules4 = append(rules4, stack.Rule{
 			Matchers: []stack.Matcher{
@@ -126,12 +133,12 @@ func setupNetStack(
 
 	dev := device.NewDevice(tun, conn.NewDefaultBind(), device.NewLogger(device.LogLevelError, ""))
 	if err := dev.IpcSet(strings.Join(configs, "\n")); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if err := dev.Up(); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return tnet, nil
+	return tnet, dev, nil
 }
 
 func unsafeGetStack(tnet *netstack.Net) *stack.Stack {
@@ -203,7 +210,7 @@ func (tm *matcher) Match(hook stack.Hook, pkt stack.PacketBufferPtr, _, _ string
 			slices.ContainsFunc(tm.DAddrPort, addrPortEq(daddr, dport))
 	}
 	if action {
-		tm.Cache.Set(proto, saddr, daddr, sport, dport)
+		tm.Cache.Set(toNetAddr(proto, saddr, sport), toNetAddr(proto, daddr, dport))
 	}
 
 	return action, false
@@ -217,4 +224,20 @@ func addrPortEq(addr tcpip.Address, port uint16) func(netip.AddrPort) bool {
 		addrS, _ := netip.AddrFromSlice(addr.AsSlice())
 		return a.Addr().Compare(addrS) == 0
 	}
+}
+
+func toNetAddr(proto tcpip.TransportProtocolNumber, addr tcpip.Address, port uint16) net.Addr {
+	switch proto {
+	case header.TCPProtocolNumber:
+		return &net.TCPAddr{
+			IP:   net.IP(addr.AsSlice()),
+			Port: int(port),
+		}
+	case header.UDPProtocolNumber:
+		return &net.UDPAddr{
+			IP:   net.IP(addr.AsSlice()),
+			Port: int(port),
+		}
+	}
+	return nil
 }

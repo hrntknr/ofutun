@@ -169,12 +169,12 @@ func run() error {
 			return fmt.Errorf("failed to get local address: %w", err)
 		}
 		addrPort := netip.AddrPortFrom(addr, opts.ListenPort)
-		if err := ofutun.PrintPeerConfigs(addrPort, localIP, ofutun.PublicKey(privateKey), peers); err != nil {
+		if err := ofutun.PrintPeerConfigs(os.Stdout, addrPort, localIP, ofutun.PublicKey(privateKey), peers, true); err != nil {
 			return fmt.Errorf("failed to print peer configs: %w", err)
 		}
 	}
 
-	if err := ofutun.Run(
+	o, err := ofutun.NewOfutun(
 		log,
 		proxy,
 		opts.ProxyInsecure,
@@ -186,8 +186,12 @@ func run() error {
 		opts.HTTPPorts,
 		opts.HTTPSPorts,
 		opts.ProxyOnly,
-	); err != nil {
-		return fmt.Errorf("failed to run ofutun: %w", err)
+	)
+	if err != nil {
+		return fmt.Errorf("failed to create instance: %w", err)
+	}
+	if err := o.Run(); err != nil {
+		return fmt.Errorf("failed to run: %w", err)
 	}
 	return nil
 }
