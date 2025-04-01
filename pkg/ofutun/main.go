@@ -2,11 +2,9 @@ package ofutun
 
 import (
 	"bufio"
-	"bytes"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/hex"
-	"errors"
 	"fmt"
 	"image/color"
 	"io"
@@ -14,8 +12,6 @@ import (
 	"net/http"
 	"net/netip"
 	"net/url"
-	"os"
-	"slices"
 	"strings"
 	"time"
 
@@ -26,6 +22,7 @@ import (
 	"github.com/miekg/dns"
 	"go.uber.org/zap"
 	"golang.org/x/crypto/curve25519"
+	"golang.zx2c4.com/wireguard/device"
 	"golang.zx2c4.com/wireguard/tun/netstack"
 )
 
@@ -35,9 +32,14 @@ type Peer struct {
 	IP         []netip.Addr
 }
 
-func PrintPeerConfigs(endpoint netip.AddrPort, localIP []netip.Addr, publicKey []byte, peers []Peer) error {
+type output interface {
+	io.StringWriter
+	io.Writer
+}
+
+func PrintPeerConfigs(out output, endpoint netip.AddrPort, localIP []netip.Addr, publicKey []byte, peers []Peer, printQR bool) error {
 	for n, peer := range peers {
-		fmt.Println("----------- Peer", n+1, "-----------")
+		out.WriteString("----------- Peer " + fmt.Sprint(n+1) + " -----------\n")
 		var privateKey string
 		if len(peer.PrivateKey) > 0 {
 			privateKey = base64.StdEncoding.EncodeToString(peer.PrivateKey)
@@ -69,8 +71,10 @@ func PrintPeerConfigs(endpoint netip.AddrPort, localIP []netip.Addr, publicKey [
 			"Endpoint = " + endpoint.String(),
 			"PersistentKeepalive = 25",
 		}
-		fmt.Println(strings.Join(line, "\n"))
-		fmt.Println()
+		out.WriteString(strings.Join(line, "\n") + "\n")
+		if !printQR {
+			continue
+		}
 		if len(peer.PublicKey) == 0 {
 			continue
 		}
@@ -84,15 +88,14 @@ func PrintPeerConfigs(endpoint netip.AddrPort, localIP []netip.Addr, publicKey [
 				if rect.Min.X <= x && x < rect.Max.X &&
 					rect.Min.Y <= y && y < rect.Max.Y &&
 					qrCode.At(x, y) == color.Black {
-
-					fmt.Print("\033[40m  \033[0m")
+					out.Write([]byte("\033[40m  \033[0m"))
 				} else {
-					fmt.Print("\033[47m  \033[0m")
+					out.Write([]byte("\033[47m  \033[0m"))
 				}
 			}
-			fmt.Println()
+			out.WriteString("\n")
 		}
-		fmt.Println()
+		out.WriteString("\n")
 	}
 	return nil
 }
@@ -112,7 +115,21 @@ func NewPrivateKey() ([]byte, error) {
 	return sk[:], nil
 }
 
-func Run(
+type Ofutun struct {
+	log           *zap.Logger
+	cache         *flowcache.FlowCache
+	stack         *netstack.Net
+	dev           *device.Device
+	proxyDialer   ProxyDialer
+	dnsForwarders []netip.Addr
+	httpPort      []uint16
+	httpsPort     []uint16
+	proxyOnly     bool
+	closed        bool
+	closers       []io.Closer
+}
+
+func NewOfutun(
 	log *zap.Logger,
 	proxy *url.URL,
 	proxyInsecureSkipVerify bool,
@@ -124,10 +141,10 @@ func Run(
 	httpPort []uint16,
 	httpsPort []uint16,
 	ProxyOnly bool,
-) error {
+) (*Ofutun, error) {
 	cache, err := flowcache.NewFlowCache()
 	if err != nil {
-		return err
+		return nil, fmt.Errorf("failed to create flow cache: %w", err)
 	}
 	configs := []string{
 		fmt.Sprintf("private_key=%s", hex.EncodeToString(privateKey)),
@@ -138,63 +155,112 @@ func Run(
 		for _, ip := range peer.IP {
 			pfx, err := ip.Prefix(ip.BitLen())
 			if err != nil {
-				return fmt.Errorf("failed to get prefix: %w", err)
+				return nil, fmt.Errorf("failed to get prefix: %w", err)
 			}
 			configs = append(configs, fmt.Sprintf("allowed_ip=%s", pfx.String()))
 		}
 	}
 
-	s, err := setupNetStack(localIP, configs, cache, httpPort, httpsPort, ProxyOnly)
+	stack, dev, err := setupNetStack(localIP, configs, cache, proxy, httpPort, httpsPort, ProxyOnly)
 	if err != nil {
-		return err
+		return nil, fmt.Errorf("failed to setup netstack: %w", err)
 	}
 
-	// todo: gracefully shutdown
+	var proxyDialer ProxyDialer
 	if proxy != nil {
-		proxyDialer := NewProxyDialer(proxy, proxyInsecureSkipVerify)
+		proxyDialer = NewProxyDialer(proxy, proxyInsecureSkipVerify)
+	}
+
+	return &Ofutun{
+		log:           log,
+		cache:         cache,
+		stack:         stack,
+		dev:           dev,
+		proxyDialer:   proxyDialer,
+		dnsForwarders: dnsForwarders,
+		httpPort:      httpPort,
+		httpsPort:     httpsPort,
+		proxyOnly:     ProxyOnly,
+		closed:        false,
+		closers:       []io.Closer{},
+	}, nil
+}
+
+func (o *Ofutun) Run() error {
+	if o.proxyDialer != nil {
 		go func() {
-			if err := setupDNS(log, s, dnsForwarders); err != nil {
-				panic(err)
+			for {
+				if err := o.setupDNS(o.dnsForwarders); err != nil {
+					if o.closed {
+						return
+					}
+					o.log.Warn("failed to setup DNS", zap.Error(err))
+					time.Sleep(5 * time.Second)
+				}
 			}
 		}()
-		for _, port := range httpPort {
+		for _, port := range o.httpPort {
 			go func(p uint16) {
-				if err := setupHTTP(log, s, proxyDialer, p); err != nil {
-					panic(err)
+				for {
+					if err := o.setupHTTP(port); err != nil {
+						if o.closed {
+							return
+						}
+						o.log.Warn("failed to setup HTTP", zap.Error(err))
+						time.Sleep(5 * time.Second)
+					}
 				}
 			}(port)
 		}
-		for _, port := range httpsPort {
+		for _, port := range o.httpsPort {
 			go func(p uint16) {
-				if err := setupHTTPS(log, s, proxyDialer, p); err != nil {
-					panic(err)
+				for {
+					if err := o.setupHTTPS(port); err != nil {
+						if o.closed {
+							return
+						}
+						o.log.Warn("failed to setup HTTPS", zap.Error(err))
+						time.Sleep(5 * time.Second)
+					}
 				}
 			}(port)
 		}
 	}
-	if !ProxyOnly {
+	if !o.proxyOnly {
 		go func() {
-			if err := setupAnyTCP(log, s, cache); err != nil {
-				panic(err)
+			for {
+				if err := o.setupAnyTCP(); err != nil {
+					if o.closed {
+						return
+					}
+					o.log.Warn("failed to setup any TCP", zap.Error(err))
+					time.Sleep(5 * time.Second)
+				}
 			}
 		}()
 		go func() {
-			if err := setupAnyUDP(log, s, cache); err != nil {
-				panic(err)
+			for {
+				if err := o.setupAnyUDP(); err != nil {
+					if o.closed {
+						return
+					}
+					o.log.Warn("failed to setup any UDP", zap.Error(err))
+					time.Sleep(5 * time.Second)
+				}
 			}
 		}()
 	}
 
-	log.Info("ofutun started", zap.Uint16("listen_port", listenPort))
+	o.log.Info("ofutun started")
 	select {}
 }
 
-func setupHTTP(log *zap.Logger, s *netstack.Net, proxyDialer ProxyDialer, port uint16) error {
-	httpListener, err := s.ListenTCP(&net.TCPAddr{Port: int(port)})
+func (o *Ofutun) setupHTTP(port uint16) error {
+	httpListener, err := o.stack.ListenTCP(&net.TCPAddr{Port: int(port)})
 	if err != nil {
 		return err
 	}
-	defer httpListener.Close()
+	o.closers = append(o.closers, httpListener)
 
 	for {
 		conn, err := httpListener.Accept()
@@ -205,15 +271,18 @@ func setupHTTP(log *zap.Logger, s *netstack.Net, proxyDialer ProxyDialer, port u
 			defer c.Close()
 			req, err := http.ReadRequest(bufio.NewReader(c))
 			if err != nil {
-				log.Warn("failed to read request", zap.Error(err))
+				o.log.Warn("failed to read request", zap.Error(err))
 				return
 			}
-			upstream, header, err := proxyDialer()
+			upstream, header, err := o.proxyDialer()
 			if err != nil {
-				log.Warn("failed to dial upstream", zap.Error(err))
+				o.log.Warn("failed to dial upstream", zap.Error(err))
 				return
 			}
-			req.URL.Opaque = "http://" + net.JoinHostPort(req.Host, fmt.Sprintf("%d", port)) + req.URL.Path
+			if req.URL.Port() == "" {
+				req.URL.Host = net.JoinHostPort(req.URL.Host, fmt.Sprintf("%d", port))
+			}
+			req.URL.Opaque = "http://" + req.Host + req.URL.Path
 			for k, v := range header {
 				for _, vv := range v {
 					req.Header.Add(k, vv)
@@ -223,23 +292,23 @@ func setupHTTP(log *zap.Logger, s *netstack.Net, proxyDialer ProxyDialer, port u
 				if checkErr(err) {
 					return
 				}
-				log.Warn("failed to write request", zap.Error(err))
+				o.log.Warn("failed to write request", zap.Error(err))
 				return
 			}
 			if err := pipe(upstream, c, c, upstream); err != nil {
-				log.Warn("failed to pipe data", zap.Error(err))
+				o.log.Warn("failed to pipe data", zap.Error(err))
 				return
 			}
 		}(conn)
 	}
 }
 
-func setupHTTPS(log *zap.Logger, s *netstack.Net, proxyDialer ProxyDialer, port uint16) error {
-	httpsListener, err := s.ListenTCP(&net.TCPAddr{Port: int(port)})
+func (o *Ofutun) setupHTTPS(port uint16) error {
+	httpsListener, err := o.stack.ListenTCP(&net.TCPAddr{Port: int(port)})
 	if err != nil {
 		return err
 	}
-	defer httpsListener.Close()
+	o.closers = append(o.closers, httpsListener)
 
 	for {
 		conn, err := httpsListener.Accept()
@@ -250,18 +319,18 @@ func setupHTTPS(log *zap.Logger, s *netstack.Net, proxyDialer ProxyDialer, port 
 			defer c.Close()
 			tlsConn, err := vhost.TLS(c)
 			if err != nil {
-				log.Warn("failed to upgrade to TLS", zap.Error(err))
+				o.log.Warn("failed to upgrade to TLS", zap.Error(err))
 				return
 			}
-			upstream, header, err := proxyDialer()
+			upstream, header, err := o.proxyDialer()
 			if err != nil {
-				log.Warn("failed to dial upstream", zap.Error(err))
+				o.log.Warn("failed to dial upstream", zap.Error(err))
 				return
 			}
 			target := net.JoinHostPort(tlsConn.Host(), fmt.Sprintf("%d", port))
 			req, err := http.NewRequest("CONNECT", "", nil)
 			if err != nil {
-				log.Warn("failed to create request", zap.Error(err))
+				o.log.Warn("failed to create request", zap.Error(err))
 				return
 			}
 			req.URL.Opaque = target
@@ -275,33 +344,33 @@ func setupHTTPS(log *zap.Logger, s *netstack.Net, proxyDialer ProxyDialer, port 
 				if checkErr(err) {
 					return
 				}
-				log.Warn("failed to write request", zap.Error(err))
+				o.log.Warn("failed to write request", zap.Error(err))
 				return
 			}
 			res, err := http.ReadResponse(bufio.NewReader(upstream), req)
 			if err != nil {
-				log.Warn("failed to read response", zap.Error(err))
+				o.log.Warn("failed to read response", zap.Error(err))
 				return
 			}
 			defer res.Body.Close()
 			if res.StatusCode < 200 || res.StatusCode >= 300 {
-				log.Warn("failed to connect", zap.String("status", res.Status))
+				o.log.Warn("failed to connect", zap.String("status", res.Status))
 				return
 			}
 			if err := pipe(upstream, tlsConn, c, res.Body); err != nil {
-				log.Warn("failed to pipe data", zap.Error(err))
+				o.log.Warn("failed to pipe data", zap.Error(err))
 				return
 			}
 		}(conn)
 	}
 }
 
-func setupAnyTCP(log *zap.Logger, s *netstack.Net, cache *flowcache.FlowCache) error {
-	anyTCPListener, err := s.ListenTCP(&net.TCPAddr{Port: 1})
+func (o *Ofutun) setupAnyTCP() error {
+	anyTCPListener, err := o.stack.ListenTCP(&net.TCPAddr{Port: 1})
 	if err != nil {
 		return err
 	}
-	defer anyTCPListener.Close()
+	o.closers = append(o.closers, anyTCPListener)
 
 	for {
 		conn, err := anyTCPListener.Accept()
@@ -310,15 +379,15 @@ func setupAnyTCP(log *zap.Logger, s *netstack.Net, cache *flowcache.FlowCache) e
 		}
 		go func(c net.Conn) {
 			defer c.Close()
-			flow := cache.Get(conn.RemoteAddr())
+			flow := o.cache.Get(conn.RemoteAddr())
 			upstream, err := net.Dial(flow.Proto, net.JoinHostPort(flow.Daddr.String(), fmt.Sprintf("%d", flow.Dport)))
 			if err != nil {
-				log.Warn("failed to dial upstream", zap.Error(err))
+				o.log.Warn("failed to dial upstream", zap.Error(err))
 				return
 			}
 			defer upstream.Close()
 			if err := pipe(upstream, c, c, upstream); err != nil {
-				log.Warn("failed to pipe data", zap.Error(err))
+				o.log.Warn("failed to pipe data", zap.Error(err))
 				return
 			}
 		}(conn)
@@ -329,12 +398,12 @@ const udpBufferSize = 65535
 const udpTimeout = 30
 const udpEntrySize = 128
 
-func setupAnyUDP(log *zap.Logger, s *netstack.Net, cache *flowcache.FlowCache) error {
-	anyUDPListener, err := s.ListenUDP(&net.UDPAddr{Port: 1})
+func (o *Ofutun) setupAnyUDP() error {
+	anyUDPListener, err := o.stack.ListenUDP(&net.UDPAddr{Port: 1})
 	if err != nil {
 		return err
 	}
-	defer anyUDPListener.Close()
+	o.closers = append(o.closers, anyUDPListener)
 
 	conns := expirable.NewLRU(udpEntrySize, func(_ [18]byte, c net.Conn) { c.Close() }, udpTimeout*time.Second)
 	buf := make([]byte, udpBufferSize)
@@ -343,7 +412,7 @@ func setupAnyUDP(log *zap.Logger, s *netstack.Net, cache *flowcache.FlowCache) e
 		if err != nil {
 			return fmt.Errorf("failed to read from UDP: %w", err)
 		}
-		flow := cache.Get(saddr)
+		flow := o.cache.Get(saddr)
 		saddr16 := flow.Saddr.To16()
 		key := [18]byte{
 			saddr16[0], saddr16[1], saddr16[2], saddr16[3],
@@ -357,7 +426,7 @@ func setupAnyUDP(log *zap.Logger, s *netstack.Net, cache *flowcache.FlowCache) e
 			target := net.JoinHostPort(flow.Daddr.String(), fmt.Sprintf("%d", flow.Dport))
 			conn, err = net.Dial(flow.Proto, target)
 			if err != nil {
-				log.Warn("failed to dial upstream", zap.Error(err))
+				o.log.Warn("failed to dial upstream", zap.Error(err))
 				continue
 			}
 			conns.Add(key, conn)
@@ -370,14 +439,14 @@ func setupAnyUDP(log *zap.Logger, s *netstack.Net, cache *flowcache.FlowCache) e
 						if checkErr(err) {
 							return
 						}
-						log.Warn("failed to read from upstream", zap.Error(err))
+						o.log.Warn("failed to read from upstream", zap.Error(err))
 						return
 					}
 					if _, err := anyUDPListener.WriteTo(buf[:n], saddr); err != nil {
 						if checkErr(err) {
 							return
 						}
-						log.Warn("failed to write to UDP", zap.Error(err))
+						o.log.Warn("failed to write to UDP", zap.Error(err))
 						return
 					}
 				}
@@ -387,7 +456,7 @@ func setupAnyUDP(log *zap.Logger, s *netstack.Net, cache *flowcache.FlowCache) e
 			if checkErr(err) {
 				continue
 			}
-			log.Warn("failed to write to upstream", zap.Error(err))
+			o.log.Warn("failed to write to upstream", zap.Error(err))
 			conn.Close()
 			conns.Remove(key)
 			continue
@@ -395,7 +464,7 @@ func setupAnyUDP(log *zap.Logger, s *netstack.Net, cache *flowcache.FlowCache) e
 	}
 }
 
-func setupDNS(_ *zap.Logger, s *netstack.Net, dnsForwarders []netip.Addr) error {
+func (o *Ofutun) setupDNS(dnsForwarders []netip.Addr) error {
 	dnsmux := dns.NewServeMux()
 	dnsmux.HandleFunc(".", func(w dns.ResponseWriter, r *dns.Msg) {
 		for _, forwarder := range dnsForwarders {
@@ -410,17 +479,17 @@ func setupDNS(_ *zap.Logger, s *netstack.Net, dnsForwarders []netip.Addr) error 
 		w.WriteMsg(m)
 	})
 
-	dnsUDPListener, err := s.ListenUDP(&net.UDPAddr{Port: 53})
+	dnsUDPListener, err := o.stack.ListenUDP(&net.UDPAddr{Port: 53})
 	if err != nil {
 		return err
 	}
-	defer dnsUDPListener.Close()
+	o.closers = append(o.closers, dnsUDPListener)
 
-	dnsTCPListener, err := s.ListenTCP(&net.TCPAddr{Port: 53})
+	dnsTCPListener, err := o.stack.ListenTCP(&net.TCPAddr{Port: 53})
 	if err != nil {
 		return err
 	}
-	defer dnsTCPListener.Close()
+	o.closers = append(o.closers, dnsTCPListener)
 
 	errCh := make(chan error, 1)
 	go func() {
@@ -436,90 +505,15 @@ func setupDNS(_ *zap.Logger, s *netstack.Net, dnsForwarders []netip.Addr) error 
 	return <-errCh
 }
 
-func pipe(
-	dst1 io.Writer, src1 io.Reader,
-	dst2 io.Writer, src2 io.Reader,
-) error {
-	ch := make(chan error, 1)
-	go func() {
-		if _, err := io.Copy(dst1, src1); err != nil {
-			if checkErr(err) {
-				ch <- nil
-				return
-			}
-			ch <- err
-		}
-	}()
-	go func() {
-		if _, err := io.Copy(dst2, src2); err != nil {
-			if checkErr(err) {
-				ch <- nil
-				return
-			}
-			ch <- err
-		}
-	}()
-	return <-ch
-}
-
-func GetAddr() (netip.Addr, error) {
-	host, err := os.Hostname()
-	if err != nil {
-		return netip.Addr{}, fmt.Errorf("failed to get hostname: %w", err)
+func (o *Ofutun) Close() error {
+	if o.closed {
+		return nil
 	}
-	addrs, err := net.LookupIP(host)
-	if err != nil {
-		_addrs, err := net.InterfaceAddrs()
-		if err != nil {
-			return netip.Addr{}, fmt.Errorf("failed to get interface addresses: %w", err)
-		}
-		addrs = make([]net.IP, len(_addrs))
-		for i, addr := range _addrs {
-			ipnet, ok := addr.(*net.IPNet)
-			if !ok {
-				return netip.Addr{}, fmt.Errorf("failed to convert interface address to IPNet: %w", err)
-			}
-			addrs[i] = ipnet.IP
+	o.closed = true
+	for _, closer := range o.closers {
+		if err := closer.Close(); err != nil {
+			return fmt.Errorf("failed to close closer: %w", err)
 		}
 	}
-	var filtered []net.IP
-	for _, addr := range addrs {
-		if addr.IsLoopback() || addr.IsLinkLocalUnicast() {
-			continue
-		}
-		if addr4 := addr.To4(); addr4 != nil {
-			filtered = append(filtered, addr4)
-		} else if addr6 := addr.To16(); addr6 != nil {
-			filtered = append(filtered, addr6)
-		}
-	}
-	slices.SortFunc(filtered, func(a, b net.IP) int {
-		ais4 := a.To4()
-		bis4 := b.To4()
-		if ais4 != nil && bis4 != nil {
-			return bytes.Compare(ais4, bis4)
-		}
-		if ais4 != nil {
-			return -1
-		}
-		if bis4 != nil {
-			return 1
-		}
-		return bytes.Compare(a, b)
-	})
-	if len(filtered) == 0 {
-		return netip.MustParseAddr("127.0.0.1"), nil
-	}
-	addr, ok := netip.AddrFromSlice(filtered[0])
-	if !ok {
-		return netip.Addr{}, fmt.Errorf("failed to convert IP address to netip.Addr: %w", err)
-	}
-	return addr, nil
-}
-
-func checkErr(err error) bool {
-	if _, ok := err.(*net.OpError); ok {
-		return true
-	}
-	return errors.Is(err, io.EOF)
+	return nil
 }
