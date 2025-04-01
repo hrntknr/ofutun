@@ -1,10 +1,13 @@
 # ofutun
 
-- **Non-privileged** Wireguard Server
-- (Optional) Convert HTTP/HTTPS proxy to **transparent proxy**
+[![codecov](https://codecov.io/gh/hrntknr/ofutun/graph/badge.svg?token=hNdnPbljmu)](https://codecov.io/gh/hrntknr/ofutun)
 
-> On mobile devices, Proxy is available only when connected to Wi-Fi.  
-> With this tool, you can use proxies regardless of Wi-Fi/mobile connection.
+- **Non-privileged** Wireguard Server
+  - It does not require any special permissions, so it works on non-rooted android.
+  - NET_ADMIN capability is also not required when running as a docker container.
+- (Optional) Convert HTTP/HTTPS proxy to **transparent proxy**
+  - On mobile devices, Proxy is available only when connected to Wi-Fi.  
+  - With this tool, you can use proxies regardless of Wi-Fi/mobile connection.
 
 ## Feature
 

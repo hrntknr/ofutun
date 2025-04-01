@@ -17,7 +17,9 @@ import (
 	"time"
 
 	"github.com/elazarl/goproxy"
+	"github.com/elazarl/goproxy/ext/auth"
 	"github.com/go-playground/assert/v2"
+	"github.com/miekg/dns"
 	"go.uber.org/zap"
 	"golang.zx2c4.com/wireguard/conn"
 	"golang.zx2c4.com/wireguard/device"
@@ -36,9 +38,9 @@ func TestHTTPWithProxy(t *testing.T) {
 		PrivateKey: peerPriv,
 		IP:         []netip.Addr{netip.MustParseAddr("192.168.0.2")},
 	}
-	server, url, httpPort := setupHTTPServer(false)
+	server, url, httpPort := setupHTTPServer(false, false)
 	defer server.Close()
-	proxy, proxyURL, _ := setupProxy(false)
+	proxy, proxyURL, _ := setupProxy(false, false, false)
 	defer proxy.Close()
 	o, err := NewOfutun(
 		zap.NewNop(),
@@ -64,7 +66,7 @@ func TestHTTPWithProxy(t *testing.T) {
 		Transport: &http.Transport{
 			DialContext: tnet.DialContext,
 		},
-		Timeout: 1 * time.Second,
+		Timeout: 10 * time.Second,
 	}
 	resp, err := client.Do(req)
 	assert.Equal(t, err, nil)
@@ -86,9 +88,9 @@ func TestHTTPSWithProxy(t *testing.T) {
 		PrivateKey: peerPriv,
 		IP:         []netip.Addr{netip.MustParseAddr("192.168.0.2")},
 	}
-	server, url, httpsPort := setupHTTPSServer(false)
+	server, url, httpsPort := setupHTTPServer(false, true)
 	defer server.Close()
-	proxy, proxyURL, _ := setupProxy(false)
+	proxy, proxyURL, _ := setupProxy(false, false, false)
 	defer proxy.Close()
 	o, err := NewOfutun(
 		zap.NewNop(),
@@ -120,7 +122,7 @@ func TestHTTPSWithProxy(t *testing.T) {
 				ServerName:         host + ".nip.io",
 			},
 		},
-		Timeout: 1 * time.Second,
+		Timeout: 10 * time.Second,
 	}
 	resp, err := client.Do(req)
 	assert.Equal(t, err, nil)
@@ -131,7 +133,7 @@ func TestHTTPSWithProxy(t *testing.T) {
 	assert.Equal(t, string(b), "pong")
 }
 
-func TestTCP(t *testing.T) {
+func TestHTTPWithHTTPSProxy(t *testing.T) {
 	priv, err := NewPrivateKey()
 	assert.Equal(t, err, nil)
 	peerPriv, err := NewPrivateKey()
@@ -142,20 +144,20 @@ func TestTCP(t *testing.T) {
 		PrivateKey: peerPriv,
 		IP:         []netip.Addr{netip.MustParseAddr("192.168.0.2")},
 	}
-	server, url, _ := setupHTTPServer(false)
+	server, url, httpPort := setupHTTPServer(false, false)
 	defer server.Close()
-	proxy, proxyURL, _ := setupProxy(false)
+	proxy, proxyURL, _ := setupProxy(false, true, false)
 	defer proxy.Close()
 	o, err := NewOfutun(
 		zap.NewNop(),
 		proxyURL,
-		false,
+		true,
 		localIP,
 		priv,
 		0,
 		[]Peer{peer},
 		[]netip.Addr{},
-		[]uint16{},
+		[]uint16{httpPort},
 		[]uint16{},
 		false,
 	)
@@ -170,7 +172,57 @@ func TestTCP(t *testing.T) {
 		Transport: &http.Transport{
 			DialContext: tnet.DialContext,
 		},
-		Timeout: 1 * time.Second,
+		Timeout: 10 * time.Second,
+	}
+	resp, err := client.Do(req)
+	assert.Equal(t, err, nil)
+	defer resp.Body.Close()
+	assert.Equal(t, resp.StatusCode, http.StatusOK)
+	b, err := io.ReadAll(resp.Body)
+	assert.Equal(t, err, nil)
+	assert.Equal(t, string(b), "pong")
+}
+
+func TestHTTPWithProxyAuth(t *testing.T) {
+	priv, err := NewPrivateKey()
+	assert.Equal(t, err, nil)
+	peerPriv, err := NewPrivateKey()
+	assert.Equal(t, err, nil)
+	localIP := []netip.Addr{netip.MustParseAddr("192.168.0.1")}
+	peer := Peer{
+		PublicKey:  PublicKey(peerPriv),
+		PrivateKey: peerPriv,
+		IP:         []netip.Addr{netip.MustParseAddr("192.168.0.2")},
+	}
+	server, url, httpPort := setupHTTPServer(false, false)
+	defer server.Close()
+	proxy, proxyURL, _ := setupProxy(false, false, true)
+	defer proxy.Close()
+	o, err := NewOfutun(
+		zap.NewNop(),
+		proxyURL,
+		false,
+		localIP,
+		priv,
+		0,
+		[]Peer{peer},
+		[]netip.Addr{},
+		[]uint16{httpPort},
+		[]uint16{},
+		false,
+	)
+	assert.Equal(t, err, nil)
+	defer o.Close()
+	go o.Run()
+	port := getPort(o)
+	_, tnet := setupClient(port, localIP, PublicKey(priv), peer)
+	req, err := http.NewRequest("GET", url.String(), nil)
+	assert.Equal(t, err, nil)
+	client := &http.Client{
+		Transport: &http.Transport{
+			DialContext: tnet.DialContext,
+		},
+		Timeout: 10 * time.Second,
 	}
 	resp, err := client.Do(req)
 	assert.Equal(t, err, nil)
@@ -192,7 +244,7 @@ func TestHTTPNoProxy(t *testing.T) {
 		PrivateKey: peerPriv,
 		IP:         []netip.Addr{netip.MustParseAddr("192.168.0.2")},
 	}
-	server, url, httpPort := setupHTTPServer(false)
+	server, url, httpPort := setupHTTPServer(false, false)
 	defer server.Close()
 	o, err := NewOfutun(
 		zap.NewNop(),
@@ -218,7 +270,7 @@ func TestHTTPNoProxy(t *testing.T) {
 		Transport: &http.Transport{
 			DialContext: tnet.DialContext,
 		},
-		Timeout: 1 * time.Second,
+		Timeout: 10 * time.Second,
 	}
 	resp, err := client.Do(req)
 	assert.Equal(t, err, nil)
@@ -227,6 +279,142 @@ func TestHTTPNoProxy(t *testing.T) {
 	b, err := io.ReadAll(resp.Body)
 	assert.Equal(t, err, nil)
 	assert.Equal(t, string(b), "pong")
+}
+
+func TestTCP(t *testing.T) {
+	priv, err := NewPrivateKey()
+	assert.Equal(t, err, nil)
+	peerPriv, err := NewPrivateKey()
+	assert.Equal(t, err, nil)
+	localIP := []netip.Addr{netip.MustParseAddr("192.168.0.1")}
+	peer := Peer{
+		PublicKey:  PublicKey(peerPriv),
+		PrivateKey: peerPriv,
+		IP:         []netip.Addr{netip.MustParseAddr("192.168.0.2")},
+	}
+	server, target, _ := setupTCPDNSServer(false)
+	defer server.Close()
+	o, err := NewOfutun(
+		zap.NewNop(),
+		nil,
+		false,
+		localIP,
+		priv,
+		0,
+		[]Peer{peer},
+		[]netip.Addr{},
+		[]uint16{},
+		[]uint16{},
+		false,
+	)
+	assert.Equal(t, err, nil)
+	defer o.Close()
+	go o.Run()
+	port := getPort(o)
+	_, tnet := setupClient(port, localIP, PublicKey(priv), peer)
+	queryTestTCPDNS(t, tnet, target)
+}
+
+func TestUDP(t *testing.T) {
+	priv, err := NewPrivateKey()
+	assert.Equal(t, err, nil)
+	peerPriv, err := NewPrivateKey()
+	assert.Equal(t, err, nil)
+	localIP := []netip.Addr{netip.MustParseAddr("192.168.0.1")}
+	peer := Peer{
+		PublicKey:  PublicKey(peerPriv),
+		PrivateKey: peerPriv,
+		IP:         []netip.Addr{netip.MustParseAddr("192.168.0.2")},
+	}
+	server, target, _ := setupUDPDNSServer(false)
+	defer server.Close()
+	o, err := NewOfutun(
+		zap.NewNop(),
+		nil,
+		false,
+		localIP,
+		priv,
+		0,
+		[]Peer{peer},
+		[]netip.Addr{},
+		[]uint16{},
+		[]uint16{},
+		false,
+	)
+	assert.Equal(t, err, nil)
+	defer o.Close()
+	go o.Run()
+	port := getPort(o)
+	_, tnet := setupClient(port, localIP, PublicKey(priv), peer)
+	queryTestUDPDNS(t, tnet, target)
+}
+
+func TestTCPIPv6(t *testing.T) {
+	priv, err := NewPrivateKey()
+	assert.Equal(t, err, nil)
+	peerPriv, err := NewPrivateKey()
+	assert.Equal(t, err, nil)
+	localIP := []netip.Addr{netip.MustParseAddr("fc00::1")}
+	peer := Peer{
+		PublicKey:  PublicKey(peerPriv),
+		PrivateKey: peerPriv,
+		IP:         []netip.Addr{netip.MustParseAddr("fc00::2")},
+	}
+	server, target, _ := setupTCPDNSServer(true)
+	defer server.Close()
+	o, err := NewOfutun(
+		zap.NewNop(),
+		nil,
+		false,
+		localIP,
+		priv,
+		0,
+		[]Peer{peer},
+		[]netip.Addr{},
+		[]uint16{},
+		[]uint16{},
+		false,
+	)
+	assert.Equal(t, err, nil)
+	defer o.Close()
+	go o.Run()
+	port := getPort(o)
+	_, tnet := setupClient(port, localIP, PublicKey(priv), peer)
+	queryTestTCPDNS(t, tnet, target)
+}
+
+func TestUDPIPv6(t *testing.T) {
+	priv, err := NewPrivateKey()
+	assert.Equal(t, err, nil)
+	peerPriv, err := NewPrivateKey()
+	assert.Equal(t, err, nil)
+	localIP := []netip.Addr{netip.MustParseAddr("fc00::1")}
+	peer := Peer{
+		PublicKey:  PublicKey(peerPriv),
+		PrivateKey: peerPriv,
+		IP:         []netip.Addr{netip.MustParseAddr("fc00::2")},
+	}
+	server, target, _ := setupUDPDNSServer(true)
+	defer server.Close()
+	o, err := NewOfutun(
+		zap.NewNop(),
+		nil,
+		false,
+		localIP,
+		priv,
+		0,
+		[]Peer{peer},
+		[]netip.Addr{},
+		[]uint16{},
+		[]uint16{},
+		false,
+	)
+	assert.Equal(t, err, nil)
+	defer o.Close()
+	go o.Run()
+	port := getPort(o)
+	_, tnet := setupClient(port, localIP, PublicKey(priv), peer)
+	queryTestUDPDNS(t, tnet, target)
 }
 
 func TestPrintPeerConfig(t *testing.T) {
@@ -317,7 +505,7 @@ func setupClient(port int, localIP []netip.Addr, pub []byte, peer Peer) (tun.Dev
 	return tun, tnet
 }
 
-func setupHTTPServer(ipv6 bool) (net.Listener, *url.URL, uint16) {
+func setupHTTPServer(ipv6 bool, tls bool) (net.Listener, *url.URL, uint16) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/ping", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain")
@@ -328,67 +516,212 @@ func setupHTTPServer(ipv6 bool) (net.Listener, *url.URL, uint16) {
 	if err != nil {
 		panic(err)
 	}
-	go http.Serve(listener, mux)
+	if tls {
+		dname, err := os.MkdirTemp("", "certs")
+		if err != nil {
+			panic(err)
+		}
+		certFile := dname + "/cert.pem"
+		keyFile := dname + "/key.pem"
+		err = os.WriteFile(certFile, LocalhostCert, 0644)
+		if err != nil {
+			panic(err)
+		}
+		err = os.WriteFile(keyFile, LocalhostKey, 0644)
+		if err != nil {
+			panic(err)
+		}
+		go http.ServeTLS(listener, mux, certFile, keyFile)
+	} else {
+		go http.Serve(listener, mux)
+	}
 
 	port := listener.Addr().(*net.TCPAddr).Port
 	host := net.JoinHostPort(getLocalAddr(ipv6).String(), strconv.Itoa(port))
-	u, err := url.Parse("http://" + host + "/ping")
+	prefix := "http://"
+	if tls {
+		prefix = "https://"
+	}
+	u, err := url.Parse(prefix + host + "/ping")
 	if err != nil {
 		panic(err)
 	}
+	for {
+		conn, err := net.Dial("tcp", host)
+		if err == nil {
+			conn.Close()
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
 	return listener, u, uint16(port)
 }
 
-func setupHTTPSServer(ipv6 bool) (net.Listener, *url.URL, uint16) {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/ping", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/plain")
-		w.WriteHeader(http.StatusOK)
-		io.WriteString(w, "pong")
-	})
-	listener, err := net.Listen("tcp", ":0")
-	if err != nil {
-		panic(err)
-	}
-	dname, err := os.MkdirTemp("", "certs")
-	if err != nil {
-		panic(err)
-	}
-	certFile := dname + "/cert.pem"
-	keyFile := dname + "/key.pem"
-	err = os.WriteFile(certFile, LocalhostCert, 0644)
-	if err != nil {
-		panic(err)
-	}
-	err = os.WriteFile(keyFile, LocalhostKey, 0644)
-	if err != nil {
-		panic(err)
-	}
-	go http.ServeTLS(listener, mux, certFile, keyFile)
-	port := listener.Addr().(*net.TCPAddr).Port
-	host := net.JoinHostPort(getLocalAddr(ipv6).String(), strconv.Itoa(port))
-	u, err := url.Parse("https://" + host + "/ping")
-	if err != nil {
-		panic(err)
-	}
-	return listener, u, uint16(port)
-}
-
-func setupProxy(ipv6 bool) (net.Listener, *url.URL, uint16) {
+func setupProxy(ipv6 bool, tls bool, authEnabled bool) (net.Listener, *url.URL, uint16) {
 	proxy := goproxy.NewProxyHttpServer()
 	proxy.Verbose = true
+	if authEnabled {
+		auth.ProxyBasic(proxy, "RELM", func(user, passwd string) bool {
+			return user == "user" && passwd == "pass"
+		})
+	}
 	listener, err := net.Listen("tcp", ":0")
 	if err != nil {
 		panic(err)
 	}
-	go http.Serve(listener, proxy)
+	if tls {
+		dname, err := os.MkdirTemp("", "certs")
+		if err != nil {
+			panic(err)
+		}
+		certFile := dname + "/cert.pem"
+		keyFile := dname + "/key.pem"
+		err = os.WriteFile(certFile, LocalhostCert, 0644)
+		if err != nil {
+			panic(err)
+		}
+		err = os.WriteFile(keyFile, LocalhostKey, 0644)
+		if err != nil {
+			panic(err)
+		}
+		go http.ServeTLS(listener, proxy, certFile, keyFile)
+	} else {
+		go http.Serve(listener, proxy)
+	}
 	port := listener.Addr().(*net.TCPAddr).Port
 	host := net.JoinHostPort(getLocalAddr(ipv6).String(), strconv.Itoa(port))
-	u, err := url.Parse("http://" + host)
+	prefix := "http://"
+	if tls {
+		prefix = "https://"
+	}
+	u, err := url.Parse(prefix + host)
 	if err != nil {
 		panic(err)
 	}
+	if authEnabled {
+		u.User = url.UserPassword("user", "pass")
+	}
+	for {
+		conn, err := net.Dial("tcp", host)
+		if err == nil {
+			conn.Close()
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 	return listener, u, uint16(port)
+}
+
+func setupTCPDNSServer(ipv6 bool) (net.Listener, string, uint16) {
+	dnsmux := dns.NewServeMux()
+	dnsmux.HandleFunc(".", func(w dns.ResponseWriter, r *dns.Msg) {
+		m := new(dns.Msg)
+		m.SetReply(r)
+		m.Compress = false
+		m.Answer = []dns.RR{
+			&dns.TXT{
+				Hdr: dns.RR_Header{
+					Name:   r.Question[0].Name,
+					Rrtype: dns.TypeTXT,
+					Class:  dns.ClassINET,
+					Ttl:    0,
+				},
+				Txt: []string{"TCP response"},
+			},
+		}
+		w.WriteMsg(m)
+	})
+
+	dnsTCPListener, err := net.ListenTCP("tcp", &net.TCPAddr{Port: 0})
+	if err != nil {
+		panic(err)
+	}
+	go dns.ActivateAndServe(dnsTCPListener, nil, dnsmux)
+	port := dnsTCPListener.Addr().(*net.TCPAddr).Port
+	host := net.JoinHostPort(getLocalAddr(ipv6).String(), strconv.Itoa(port))
+	return dnsTCPListener, host, uint16(port)
+}
+
+func setupUDPDNSServer(ipv6 bool) (net.Conn, string, uint16) {
+	dnsmux := dns.NewServeMux()
+	dnsmux.HandleFunc(".", func(w dns.ResponseWriter, r *dns.Msg) {
+		m := new(dns.Msg)
+		m.SetReply(r)
+		m.Compress = false
+		m.Answer = []dns.RR{
+			&dns.TXT{
+				Hdr: dns.RR_Header{
+					Name:   r.Question[0].Name,
+					Rrtype: dns.TypeTXT,
+					Class:  dns.ClassINET,
+					Ttl:    0,
+				},
+				Txt: []string{"UDP response"},
+			},
+		}
+		w.WriteMsg(m)
+	})
+
+	dnsUDPListener, err := net.ListenUDP("udp", &net.UDPAddr{Port: 0})
+	if err != nil {
+		panic(err)
+	}
+	go dns.ActivateAndServe(nil, dnsUDPListener, dnsmux)
+	port := dnsUDPListener.LocalAddr().(*net.UDPAddr).Port
+	host := net.JoinHostPort(getLocalAddr(ipv6).String(), strconv.Itoa(port))
+	return dnsUDPListener, host, uint16(port)
+}
+
+func queryTestTCPDNS(t *testing.T, tnet *netstack.Net, target string) {
+	m := new(dns.Msg)
+	m.SetQuestion("example.com.", dns.TypeTXT)
+	conn := new(dns.Conn)
+	var err error
+	conn.Conn, err = tnet.Dial("tcp", target)
+	if err != nil {
+		panic(err)
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(3 * time.Second))
+	if err := conn.WriteMsg(m); err != nil {
+		panic(err)
+	}
+	msg, err := conn.ReadMsg()
+	if err != nil {
+		panic(err)
+	}
+	assert.Equal(t, msg.Rcode, dns.RcodeSuccess)
+	assert.Equal(t, len(msg.Answer), 1)
+	msgTXT := msg.Answer[0].(*dns.TXT)
+	assert.Equal(t, msgTXT.Hdr.Rrtype, dns.TypeTXT)
+	assert.Equal(t, msgTXT.Txt[0], "TCP response")
+
+}
+
+func queryTestUDPDNS(t *testing.T, tnet *netstack.Net, target string) {
+	m := new(dns.Msg)
+	m.SetQuestion("example.com.", dns.TypeTXT)
+	conn := new(dns.Conn)
+	var err error
+	conn.Conn, err = tnet.Dial("udp", target)
+	if err != nil {
+		panic(err)
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(3 * time.Second))
+	if err := conn.WriteMsg(m); err != nil {
+		panic(err)
+	}
+	msg, err := conn.ReadMsg()
+	if err != nil {
+		panic(err)
+	}
+	assert.Equal(t, msg.Rcode, dns.RcodeSuccess)
+	assert.Equal(t, len(msg.Answer), 1)
+	msgTXT := msg.Answer[0].(*dns.TXT)
+	assert.Equal(t, msgTXT.Hdr.Rrtype, dns.TypeTXT)
+	assert.Equal(t, msgTXT.Txt[0], "UDP response")
 }
 
 func getLocalAddr(ipv6 bool) net.IP {
@@ -398,7 +731,7 @@ func getLocalAddr(ipv6 bool) net.IP {
 	}
 
 	for _, a := range addr {
-		if ipnet, ok := a.(*net.IPNet); ok && ipnet.IP.To4() != nil {
+		if ipnet, ok := a.(*net.IPNet); ok {
 			if ipnet.IP.IsPrivate() || ipnet.IP.IsGlobalUnicast() {
 				if (ipv6 && ipnet.IP.To4() == nil) || (!ipv6 && ipnet.IP.To4() != nil) {
 					return ipnet.IP
