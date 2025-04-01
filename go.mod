@@ -5,6 +5,7 @@ go 1.23.4
 require (
 	github.com/boombuler/barcode v1.0.2
 	github.com/elazarl/goproxy v1.7.2
+	github.com/elazarl/goproxy/ext v0.0.0-20250305112401-088f758167d2
 	github.com/go-playground/assert/v2 v2.2.0
 	github.com/hashicorp/golang-lru/v2 v2.0.7
 	github.com/inconshreveable/go-vhost v1.0.0

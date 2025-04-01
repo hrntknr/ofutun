@@ -16,7 +16,7 @@ func DialProxy(url *url.URL, proxyInsecureSkipVerify bool) (net.Conn, http.Heade
 		if err != nil {
 			return nil, nil, fmt.Errorf("failed to dial proxy: %w", err)
 		}
-		return conn, auth(url), nil
+		return conn, authHeader(url), nil
 	case "https":
 		conn, err := tls.Dial("tcp", url.Host, &tls.Config{
 			InsecureSkipVerify: proxyInsecureSkipVerify,
@@ -24,13 +24,13 @@ func DialProxy(url *url.URL, proxyInsecureSkipVerify bool) (net.Conn, http.Heade
 		if err != nil {
 			return nil, nil, fmt.Errorf("failed to dial proxy: %w", err)
 		}
-		return conn, auth(url), nil
+		return conn, authHeader(url), nil
 	default:
 		return nil, nil, fmt.Errorf("unsupported scheme: %s", url.Scheme)
 	}
 }
 
-func auth(url *url.URL) http.Header {
+func authHeader(url *url.URL) http.Header {
 	if url.User == nil {
 		return nil
 	}

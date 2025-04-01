@@ -317,6 +317,7 @@ func (o *Ofutun) setupHTTPS(port uint16) error {
 		}
 		go func(c net.Conn) {
 			defer c.Close()
+			flow := o.cache.Get(conn.RemoteAddr())
 			tlsConn, err := vhost.TLS(c)
 			if err != nil {
 				o.log.Warn("failed to upgrade to TLS", zap.Error(err))
@@ -327,7 +328,11 @@ func (o *Ofutun) setupHTTPS(port uint16) error {
 				o.log.Warn("failed to dial upstream", zap.Error(err))
 				return
 			}
-			target := net.JoinHostPort(tlsConn.Host(), fmt.Sprintf("%d", port))
+			host := tlsConn.Host()
+			if host == "" {
+				host = flow.Daddr.String()
+			}
+			target := net.JoinHostPort(host, fmt.Sprintf("%d", port))
 			req, err := http.NewRequest("CONNECT", "", nil)
 			if err != nil {
 				o.log.Warn("failed to create request", zap.Error(err))
