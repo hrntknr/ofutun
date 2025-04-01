@@ -9,6 +9,9 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: set ipv6
+        run: sudo ip addr add fc01::1/64 dev lo
+
       - name: Set up Go
         uses: actions/setup-go@v4
         with:
