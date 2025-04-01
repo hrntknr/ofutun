@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/hex"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -40,7 +41,7 @@ func TestHTTPWithProxy(t *testing.T) {
 	}
 	server, url, httpPort := setupHTTPServer(false, false)
 	defer server.Close()
-	proxy, proxyURL, _ := setupProxy(false, false, false)
+	proxy, proxyURL, _, log := setupProxy(false, false, false)
 	defer proxy.Close()
 	o, err := NewOfutun(
 		zap.NewNop(),
@@ -75,6 +76,8 @@ func TestHTTPWithProxy(t *testing.T) {
 	b, err := io.ReadAll(resp.Body)
 	assert.Equal(t, err, nil)
 	assert.Equal(t, string(b), "pong")
+	assert.Equal(t, len(log.http), 1)
+	assert.Equal(t, log.http[0], url.String())
 }
 
 func TestHTTPSWithProxy(t *testing.T) {
@@ -90,7 +93,7 @@ func TestHTTPSWithProxy(t *testing.T) {
 	}
 	server, url, httpsPort := setupHTTPServer(false, true)
 	defer server.Close()
-	proxy, proxyURL, _ := setupProxy(false, false, false)
+	proxy, proxyURL, _, log := setupProxy(false, false, false)
 	defer proxy.Close()
 	o, err := NewOfutun(
 		zap.NewNop(),
@@ -131,6 +134,8 @@ func TestHTTPSWithProxy(t *testing.T) {
 	b, err := io.ReadAll(resp.Body)
 	assert.Equal(t, err, nil)
 	assert.Equal(t, string(b), "pong")
+	assert.Equal(t, len(log.https), 1)
+	assert.Equal(t, log.https[0], fmt.Sprintf("%s.nip.io:%d", host, httpsPort))
 }
 
 func TestHTTPWithHTTPSProxy(t *testing.T) {
@@ -146,7 +151,7 @@ func TestHTTPWithHTTPSProxy(t *testing.T) {
 	}
 	server, url, httpPort := setupHTTPServer(false, false)
 	defer server.Close()
-	proxy, proxyURL, _ := setupProxy(false, true, false)
+	proxy, proxyURL, _, log := setupProxy(false, true, false)
 	defer proxy.Close()
 	o, err := NewOfutun(
 		zap.NewNop(),
@@ -181,6 +186,8 @@ func TestHTTPWithHTTPSProxy(t *testing.T) {
 	b, err := io.ReadAll(resp.Body)
 	assert.Equal(t, err, nil)
 	assert.Equal(t, string(b), "pong")
+	assert.Equal(t, len(log.http), 1)
+	assert.Equal(t, log.http[0], url.String())
 }
 
 func TestHTTPWithProxyAuth(t *testing.T) {
@@ -196,7 +203,7 @@ func TestHTTPWithProxyAuth(t *testing.T) {
 	}
 	server, url, httpPort := setupHTTPServer(false, false)
 	defer server.Close()
-	proxy, proxyURL, _ := setupProxy(false, false, true)
+	proxy, proxyURL, _, log := setupProxy(false, false, true)
 	defer proxy.Close()
 	o, err := NewOfutun(
 		zap.NewNop(),
@@ -231,6 +238,8 @@ func TestHTTPWithProxyAuth(t *testing.T) {
 	b, err := io.ReadAll(resp.Body)
 	assert.Equal(t, err, nil)
 	assert.Equal(t, string(b), "pong")
+	assert.Equal(t, len(log.http), 1)
+	assert.Equal(t, log.http[0], url.String())
 }
 
 func TestHTTPNoProxy(t *testing.T) {
@@ -279,6 +288,63 @@ func TestHTTPNoProxy(t *testing.T) {
 	b, err := io.ReadAll(resp.Body)
 	assert.Equal(t, err, nil)
 	assert.Equal(t, string(b), "pong")
+}
+
+func TestHTTPSWithProxyNoSNI(t *testing.T) {
+	priv, err := NewPrivateKey()
+	assert.Equal(t, err, nil)
+	peerPriv, err := NewPrivateKey()
+	assert.Equal(t, err, nil)
+	localIP := []netip.Addr{netip.MustParseAddr("192.168.0.1")}
+	peer := Peer{
+		PublicKey:  PublicKey(peerPriv),
+		PrivateKey: peerPriv,
+		IP:         []netip.Addr{netip.MustParseAddr("192.168.0.2")},
+	}
+	server, url, httpsPort := setupHTTPServer(false, true)
+	defer server.Close()
+	proxy, proxyURL, _, log := setupProxy(false, false, false)
+	defer proxy.Close()
+	o, err := NewOfutun(
+		zap.NewNop(),
+		proxyURL,
+		false,
+		localIP,
+		priv,
+		0,
+		[]Peer{peer},
+		[]netip.Addr{},
+		[]uint16{},
+		[]uint16{httpsPort},
+		false,
+	)
+	assert.Equal(t, err, nil)
+	defer o.Close()
+	go o.Run()
+	port := getPort(o)
+	_, tnet := setupClient(port, localIP, PublicKey(priv), peer)
+	req, err := http.NewRequest("GET", url.String(), nil)
+	assert.Equal(t, err, nil)
+	host, _, err := net.SplitHostPort(url.Host)
+	assert.Equal(t, err, nil)
+	client := &http.Client{
+		Transport: &http.Transport{
+			DialContext: tnet.DialContext,
+			TLSClientConfig: &tls.Config{
+				InsecureSkipVerify: true,
+			},
+		},
+		Timeout: 10 * time.Second,
+	}
+	resp, err := client.Do(req)
+	assert.Equal(t, err, nil)
+	defer resp.Body.Close()
+	assert.Equal(t, resp.StatusCode, http.StatusOK)
+	b, err := io.ReadAll(resp.Body)
+	assert.Equal(t, err, nil)
+	assert.Equal(t, string(b), "pong")
+	assert.Equal(t, len(log.https), 1)
+	assert.Equal(t, log.https[0], fmt.Sprintf("%s:%d", host, httpsPort))
 }
 
 func TestTCP(t *testing.T) {
@@ -558,9 +624,27 @@ func setupHTTPServer(ipv6 bool, tls bool) (net.Listener, *url.URL, uint16) {
 	return listener, u, uint16(port)
 }
 
-func setupProxy(ipv6 bool, tls bool, authEnabled bool) (net.Listener, *url.URL, uint16) {
+type proxyLog struct {
+	https []string
+	http  []string
+}
+
+func setupProxy(ipv6 bool, tls bool, authEnabled bool) (net.Listener, *url.URL, uint16, *proxyLog) {
+	log := &proxyLog{
+		https: []string{},
+		http:  []string{},
+	}
+
 	proxy := goproxy.NewProxyHttpServer()
 	proxy.Verbose = true
+	proxy.OnRequest().HandleConnectFunc(func(host string, ctx *goproxy.ProxyCtx) (*goproxy.ConnectAction, string) {
+		log.https = append(log.https, host)
+		return goproxy.OkConnect, host
+	})
+	proxy.OnRequest().DoFunc(func(req *http.Request, ctx *goproxy.ProxyCtx) (*http.Request, *http.Response) {
+		log.http = append(log.http, req.URL.String())
+		return req, nil
+	})
 	if authEnabled {
 		auth.ProxyBasic(proxy, "RELM", func(user, passwd string) bool {
 			return user == "user" && passwd == "pass"
@@ -610,7 +694,7 @@ func setupProxy(ipv6 bool, tls bool, authEnabled bool) (net.Listener, *url.URL, 
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	return listener, u, uint16(port)
+	return listener, u, uint16(port), log
 }
 
 func setupTCPDNSServer(ipv6 bool) (net.Listener, string, uint16) {
