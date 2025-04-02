@@ -2,6 +2,7 @@ package flowcache
 
 import (
 	"net"
+	"strconv"
 
 	lru "github.com/hashicorp/golang-lru/v2"
 )
@@ -42,6 +43,7 @@ func (fc *FlowCache) Get(saddr net.Addr) *Flow {
 	}
 	return entry
 }
+
 func (fc *FlowCache) Set(saddr net.Addr, daddr net.Addr) {
 	if saddr == nil || daddr == nil {
 		panic("nil address")
@@ -59,6 +61,13 @@ func (fc *FlowCache) Set(saddr net.Addr, daddr net.Addr) {
 		Dport: dport,
 	}
 	fc.cache.Add(key(sproto, saddrIP, sport), entry)
+}
+
+func (f *Flow) Dst() string {
+	if f.Dport == 0 {
+		return f.Daddr.String()
+	}
+	return net.JoinHostPort(f.Daddr.String(), strconv.Itoa(int(f.Dport)))
 }
 
 func key(proto uint8, addr net.IP, port uint16) [KeySize]byte {
