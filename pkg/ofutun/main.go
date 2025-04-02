@@ -187,18 +187,18 @@ func NewOfutun(
 }
 
 func (o *Ofutun) Run() error {
-	if o.proxyDialer != nil {
-		go func() {
-			for {
-				if err := o.setupDNS(o.dnsForwarders); err != nil {
-					if o.closed {
-						return
-					}
-					o.log.Warn("failed to setup DNS", zap.Error(err))
-					time.Sleep(5 * time.Second)
+	go func() {
+		for {
+			if err := o.setupDNS(o.dnsForwarders); err != nil {
+				if o.closed {
+					return
 				}
+				o.log.Warn("failed to setup DNS", zap.Error(err))
+				time.Sleep(5 * time.Second)
 			}
-		}()
+		}
+	}()
+	if o.proxyDialer != nil {
 		for _, port := range o.httpPort {
 			go func(p uint16) {
 				for {
