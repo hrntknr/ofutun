@@ -15,7 +15,7 @@
   - Everything works in user space and no root privileges are required.
   - Built-in TCP/IP stack by [gvisor](https://gvisor.dev/)
   - Terminate tcp/udp connections in the ofutun, and Convert to tcp/udp stream from ofutun.
-- http/https proxy conversion by SNI/Hosts header
+- Convert HTTP/HTTPS proxy to transparent proxy.
 
 ## Pattern
 

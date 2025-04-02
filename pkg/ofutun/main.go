@@ -269,6 +269,7 @@ func (o *Ofutun) setupHTTP(port uint16) error {
 		}
 		go func(c net.Conn) {
 			defer c.Close()
+			flow := o.cache.Get(conn.RemoteAddr())
 			req, err := http.ReadRequest(bufio.NewReader(c))
 			if err != nil {
 				o.log.Warn("failed to read request", zap.Error(err))
@@ -279,9 +280,8 @@ func (o *Ofutun) setupHTTP(port uint16) error {
 				o.log.Warn("failed to dial upstream", zap.Error(err))
 				return
 			}
-			if req.URL.Port() == "" {
-				req.URL.Host = net.JoinHostPort(req.URL.Host, fmt.Sprintf("%d", port))
-			}
+			fmt.Println(flow.Dst())
+			req.URL.Host = flow.Dst()
 			req.URL.Opaque = "http://" + req.Host + req.URL.Path
 			for k, v := range header {
 				for _, vv := range v {
@@ -328,18 +328,14 @@ func (o *Ofutun) setupHTTPS(port uint16) error {
 				o.log.Warn("failed to dial upstream", zap.Error(err))
 				return
 			}
-			host := tlsConn.Host()
-			if host == "" {
-				host = flow.Daddr.String()
-			}
-			target := net.JoinHostPort(host, fmt.Sprintf("%d", port))
 			req, err := http.NewRequest("CONNECT", "", nil)
 			if err != nil {
 				o.log.Warn("failed to create request", zap.Error(err))
 				return
 			}
-			req.URL.Opaque = target
-			req.Host = target
+			fmt.Println(flow.Dst())
+			req.URL.Opaque = flow.Dst()
+			req.Host = flow.Dst()
 			for k, v := range header {
 				for _, vv := range v {
 					req.Header.Add(k, vv)

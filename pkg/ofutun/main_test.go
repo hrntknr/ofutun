@@ -135,7 +135,7 @@ func TestHTTPSWithProxy(t *testing.T) {
 	assert.Equal(t, err, nil)
 	assert.Equal(t, string(b), "pong")
 	assert.Equal(t, len(log.https), 1)
-	assert.Equal(t, log.https[0], fmt.Sprintf("%s.nip.io:%d", host, httpsPort))
+	assert.Equal(t, log.https[0], fmt.Sprintf("%s:%d", host, httpsPort))
 }
 
 func TestHTTPWithHTTPSProxy(t *testing.T) {
