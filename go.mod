@@ -13,6 +13,7 @@ require (
 	github.com/miekg/dns v1.1.64
 	go.uber.org/zap v1.27.0
 	golang.org/x/crypto v0.36.0
+	golang.org/x/net v0.38.0
 	golang.zx2c4.com/wireguard v0.0.0-20231211153847-12269c276173
 	gvisor.dev/gvisor v0.0.0-20230927004350-cbd86285d259
 )
@@ -21,7 +22,6 @@ require (
 	github.com/google/btree v1.1.3 // indirect
 	go.uber.org/multierr v1.10.0 // indirect
 	golang.org/x/mod v0.23.0 // indirect
-	golang.org/x/net v0.38.0 // indirect
 	golang.org/x/sync v0.12.0 // indirect
 	golang.org/x/sys v0.31.0 // indirect
 	golang.org/x/text v0.23.0 // indirect
