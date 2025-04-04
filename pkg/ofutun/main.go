@@ -2,9 +2,11 @@ package ofutun
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"image/color"
 	"io"
@@ -18,12 +20,19 @@ import (
 	"github.com/boombuler/barcode/qr"
 	"github.com/hashicorp/golang-lru/v2/expirable"
 	"github.com/hrntknr/ofutun/pkg/flowcache"
+	"github.com/hrntknr/ofutun/pkg/netstack"
 	"github.com/inconshreveable/go-vhost"
 	"github.com/miekg/dns"
 	"go.uber.org/zap"
 	"golang.org/x/crypto/curve25519"
+	"golang.org/x/net/icmp"
 	"golang.zx2c4.com/wireguard/device"
-	"golang.zx2c4.com/wireguard/tun/netstack"
+
+	// "golang.zx2c4.com/wireguard/tun/netstack"
+	"gvisor.dev/gvisor/pkg/tcpip"
+	"gvisor.dev/gvisor/pkg/tcpip/header"
+	"gvisor.dev/gvisor/pkg/tcpip/stack"
+	"gvisor.dev/gvisor/pkg/waiter"
 )
 
 type Peer struct {
@@ -118,8 +127,10 @@ func NewPrivateKey() ([]byte, error) {
 type Ofutun struct {
 	log           *zap.Logger
 	cache         *flowcache.FlowCache
-	stack         *netstack.Net
+	net           *netstack.Net
 	dev           *device.Device
+	icmpTap       chan stack.PacketBufferPtr
+	stack         *stack.Stack
 	proxyDialer   ProxyDialer
 	dnsForwarders []netip.Addr
 	httpPort      []uint16
@@ -161,7 +172,7 @@ func NewOfutun(
 		}
 	}
 
-	stack, dev, err := setupNetStack(localIP, configs, cache, proxy, httpPort, httpsPort, ProxyOnly)
+	net, dev, icmpTap, s, err := setupNetStack(localIP, configs, cache, proxy, httpPort, httpsPort, ProxyOnly)
 	if err != nil {
 		return nil, fmt.Errorf("failed to setup netstack: %w", err)
 	}
@@ -174,8 +185,10 @@ func NewOfutun(
 	return &Ofutun{
 		log:           log,
 		cache:         cache,
-		stack:         stack,
+		net:           net,
 		dev:           dev,
+		icmpTap:       icmpTap,
+		stack:         s,
 		proxyDialer:   proxyDialer,
 		dnsForwarders: dnsForwarders,
 		httpPort:      httpPort,
@@ -229,6 +242,17 @@ func (o *Ofutun) Run() error {
 	if !o.proxyOnly {
 		go func() {
 			for {
+				if err := o.setupICMPTap(); err != nil {
+					if o.closed {
+						return
+					}
+					o.log.Warn("failed to setup ICMP tap", zap.Error(err))
+					time.Sleep(5 * time.Second)
+				}
+			}
+		}()
+		go func() {
+			for {
 				if err := o.setupAnyTCP(); err != nil {
 					if o.closed {
 						return
@@ -256,7 +280,7 @@ func (o *Ofutun) Run() error {
 }
 
 func (o *Ofutun) setupHTTP(port uint16) error {
-	httpListener, err := o.stack.ListenTCP(&net.TCPAddr{Port: int(port)})
+	httpListener, err := o.net.ListenTCP(&net.TCPAddr{Port: int(port)})
 	if err != nil {
 		return err
 	}
@@ -303,7 +327,7 @@ func (o *Ofutun) setupHTTP(port uint16) error {
 }
 
 func (o *Ofutun) setupHTTPS(port uint16) error {
-	httpsListener, err := o.stack.ListenTCP(&net.TCPAddr{Port: int(port)})
+	httpsListener, err := o.net.ListenTCP(&net.TCPAddr{Port: int(port)})
 	if err != nil {
 		return err
 	}
@@ -364,8 +388,125 @@ func (o *Ofutun) setupHTTPS(port uint16) error {
 	}
 }
 
+const icmoConntrackEntrySize = 128
+const icmpTimeout = 30
+
+func (o *Ofutun) setupICMPTap() error {
+	icmp4Socket, err := icmp.ListenPacket("udp4", "")
+	if err != nil {
+		return fmt.Errorf("failed to listen on ICMP socket: %w", err)
+	}
+	defer icmp4Socket.Close()
+	icmp6Socket, err := icmp.ListenPacket("udp6", "")
+	if err != nil {
+		return fmt.Errorf("failed to listen on ICMP socket: %w", err)
+	}
+	defer icmp6Socket.Close()
+	conntrack := expirable.NewLRU[[16]byte, [16]byte](icmoConntrackEntrySize, nil, icmpTimeout*time.Second)
+
+	go func() {
+		buf := make([]byte, 65535)
+		for {
+			n, from, err := icmp4Socket.ReadFrom(buf)
+			if err != nil {
+				if checkErr(err) {
+					continue
+				}
+				o.log.Warn("failed to read from ICMP socket", zap.Error(err))
+				continue
+			}
+			fromAddr := from.(*net.UDPAddr)
+			dst, ok := conntrack.Get([16]byte(fromAddr.IP.To16()))
+			if !ok {
+				o.log.Warn("failed to get conntrack entry", zap.Error(err))
+				continue
+			}
+			if err := o.writeICMP(dst, [16]byte(fromAddr.IP.To16()), buf[:n]); err != nil {
+				if checkErr(err) {
+					continue
+				}
+				o.log.Warn("failed to write ICMP", zap.Error(err))
+				continue
+			}
+		}
+	}()
+	go func() {
+		buf := make([]byte, 65535)
+		for {
+			n, from, err := icmp6Socket.ReadFrom(buf)
+			if err != nil {
+				if checkErr(err) {
+					continue
+				}
+				o.log.Warn("failed to read from ICMP socket", zap.Error(err))
+				continue
+			}
+			fmt.Println("ICMP from", from, ":", n)
+		}
+	}()
+	for {
+		icmpPkt := <-o.icmpTap
+		go func(pkt stack.PacketBufferPtr) {
+			var saddr tcpip.Address
+			var iphdrSize int
+			var socket *icmp.PacketConn
+			switch pkt.NetworkProtocolNumber {
+			case header.IPv4ProtocolNumber:
+				ipv4 := pkt.NetworkHeader().Slice()
+				netHeader := header.IPv4(ipv4)
+				saddr = netHeader.SourceAddress()
+				iphdrSize = len(ipv4)
+				socket = icmp4Socket
+			case header.IPv6ProtocolNumber:
+				ipv6 := pkt.NetworkHeader().Slice()
+				netHeader := header.IPv6(ipv6)
+				saddr = netHeader.SourceAddress()
+				iphdrSize = len(ipv6)
+				socket = icmp6Socket
+			default:
+				o.log.Warn("unknown network protocol", zap.Uint16("protocol", uint16(pkt.NetworkProtocolNumber)))
+				return
+			}
+			flow := o.cache.Get(&net.IPAddr{IP: saddr.AsSlice()})
+			conntrack.Add([16]byte(flow.Daddr.To16()), [16]byte(flow.Saddr.To16()))
+			_, err := socket.WriteTo(pkt.ToView().AsSlice()[iphdrSize:], &net.UDPAddr{IP: flow.Daddr})
+			if err != nil {
+				if checkErr(err) {
+					return
+				}
+				o.log.Warn("failed to write to ICMP socket", zap.Error(err))
+				return
+			}
+		}(icmpPkt)
+	}
+}
+
+func (o *Ofutun) writeICMP(dst [16]byte, src [16]byte, data []byte) error {
+	var wq waiter.Queue
+	ep, terr := o.stack.NewPacketEndpoint(true, header.IPv4ProtocolNumber, &wq)
+	if terr != nil {
+		return errors.New(terr.String())
+	}
+	fmt.Println(hex.Dump(data))
+	var r bytes.Reader
+	r.Reset([]byte{
+		0x45, 0x00, 0x00, 0x01,
+		0x00, 0x00, 0x00, 0x00,
+		0x40, 0x01, 0x00, 0x00,
+		8, 8, 8, 8,
+		192, 168, 0, 2,
+		0x01,
+	})
+	if _, err := ep.Write(&r, tcpip.WriteOptions{}); err != nil {
+		return fmt.Errorf("failed to write to endpoint: %s", err.String())
+	}
+	defer ep.Close()
+
+	return nil
+}
+
 func (o *Ofutun) setupAnyTCP() error {
-	anyTCPListener, err := o.stack.ListenTCP(&net.TCPAddr{Port: 1})
+	anyTCPListener, err := o.net.ListenTCP(&net.TCPAddr{Port: 1})
 	if err != nil {
 		return err
 	}
@@ -398,7 +539,7 @@ const udpTimeout = 30
 const udpEntrySize = 128
 
 func (o *Ofutun) setupAnyUDP() error {
-	anyUDPListener, err := o.stack.ListenUDP(&net.UDPAddr{Port: 1})
+	anyUDPListener, err := o.net.ListenUDP(&net.UDPAddr{Port: 1})
 	if err != nil {
 		return err
 	}
@@ -478,13 +619,13 @@ func (o *Ofutun) setupDNS(dnsForwarders []netip.Addr) error {
 		w.WriteMsg(m)
 	})
 
-	dnsUDPListener, err := o.stack.ListenUDP(&net.UDPAddr{Port: 53})
+	dnsUDPListener, err := o.net.ListenUDP(&net.UDPAddr{Port: 53})
 	if err != nil {
 		return err
 	}
 	o.closers = append(o.closers, dnsUDPListener)
 
-	dnsTCPListener, err := o.stack.ListenTCP(&net.TCPAddr{Port: 53})
+	dnsTCPListener, err := o.net.ListenTCP(&net.TCPAddr{Port: 53})
 	if err != nil {
 		return err
 	}
