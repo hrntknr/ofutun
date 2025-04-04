@@ -280,7 +280,6 @@ func (o *Ofutun) setupHTTP(port uint16) error {
 				o.log.Warn("failed to dial upstream", zap.Error(err))
 				return
 			}
-			fmt.Println(flow.Dst())
 			req.URL.Host = flow.Dst()
 			req.URL.Opaque = "http://" + req.Host + req.URL.Path
 			for k, v := range header {
@@ -333,7 +332,6 @@ func (o *Ofutun) setupHTTPS(port uint16) error {
 				o.log.Warn("failed to create request", zap.Error(err))
 				return
 			}
-			fmt.Println(flow.Dst())
 			req.URL.Opaque = flow.Dst()
 			req.Host = flow.Dst()
 			for k, v := range header {
