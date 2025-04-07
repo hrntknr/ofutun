@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"crypto/rand"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -26,6 +27,8 @@ import (
 	"go.uber.org/zap"
 	"golang.org/x/crypto/curve25519"
 	"golang.org/x/net/icmp"
+	"golang.org/x/net/ipv4"
+	"golang.org/x/net/ipv6"
 	"golang.zx2c4.com/wireguard/device"
 
 	// "golang.zx2c4.com/wireguard/tun/netstack"
@@ -402,7 +405,7 @@ func (o *Ofutun) setupICMPTap() error {
 		return fmt.Errorf("failed to listen on ICMP socket: %w", err)
 	}
 	defer icmp6Socket.Close()
-	conntrack := expirable.NewLRU[[16]byte, [16]byte](icmoConntrackEntrySize, nil, icmpTimeout*time.Second)
+	conntrack := expirable.NewLRU[[16]byte, [18]byte](icmoConntrackEntrySize, nil, icmpTimeout*time.Second)
 
 	go func() {
 		buf := make([]byte, 65535)
@@ -415,17 +418,8 @@ func (o *Ofutun) setupICMPTap() error {
 				o.log.Warn("failed to read from ICMP socket", zap.Error(err))
 				continue
 			}
-			fromAddr := from.(*net.UDPAddr)
-			dst, ok := conntrack.Get([16]byte(fromAddr.IP.To16()))
-			if !ok {
-				o.log.Warn("failed to get conntrack entry", zap.Error(err))
-				continue
-			}
-			if err := o.writeICMP(dst, [16]byte(fromAddr.IP.To16()), buf[:n]); err != nil {
-				if checkErr(err) {
-					continue
-				}
-				o.log.Warn("failed to write ICMP", zap.Error(err))
+			if err := o.handleICMP(buf[:n], from, conntrack); err != nil {
+				o.log.Warn("failed to handle ICMP", zap.Error(err))
 				continue
 			}
 		}
@@ -441,13 +435,17 @@ func (o *Ofutun) setupICMPTap() error {
 				o.log.Warn("failed to read from ICMP socket", zap.Error(err))
 				continue
 			}
-			fmt.Println("ICMP from", from, ":", n)
+			if err := o.handleICMP(buf[:n], from, conntrack); err != nil {
+				o.log.Warn("failed to handle ICMP", zap.Error(err))
+				continue
+			}
 		}
 	}()
 	for {
 		icmpPkt := <-o.icmpTap
 		go func(pkt stack.PacketBufferPtr) {
 			var saddr tcpip.Address
+			var proto tcpip.TransportProtocolNumber
 			var iphdrSize int
 			var socket *icmp.PacketConn
 			switch pkt.NetworkProtocolNumber {
@@ -455,11 +453,13 @@ func (o *Ofutun) setupICMPTap() error {
 				ipv4 := pkt.NetworkHeader().Slice()
 				netHeader := header.IPv4(ipv4)
 				saddr = netHeader.SourceAddress()
+				proto = netHeader.TransportProtocol()
 				iphdrSize = len(ipv4)
 				socket = icmp4Socket
 			case header.IPv6ProtocolNumber:
 				ipv6 := pkt.NetworkHeader().Slice()
 				netHeader := header.IPv6(ipv6)
+				proto = netHeader.TransportProtocol()
 				saddr = netHeader.SourceAddress()
 				iphdrSize = len(ipv6)
 				socket = icmp6Socket
@@ -467,10 +467,23 @@ func (o *Ofutun) setupICMPTap() error {
 				o.log.Warn("unknown network protocol", zap.Uint16("protocol", uint16(pkt.NetworkProtocolNumber)))
 				return
 			}
-			flow := o.cache.Get(&net.IPAddr{IP: saddr.AsSlice()})
-			conntrack.Add([16]byte(flow.Daddr.To16()), [16]byte(flow.Saddr.To16()))
-			_, err := socket.WriteTo(pkt.ToView().AsSlice()[iphdrSize:], &net.UDPAddr{IP: flow.Daddr})
+			msg, err := icmp.ParseMessage(int(proto), pkt.ToView().AsSlice()[iphdrSize:])
 			if err != nil {
+				o.log.Warn("failed to parse ICMP message", zap.Error(err))
+				return
+			}
+			if msg.Type.Protocol() != ipv4.ICMPTypeEcho.Protocol() &&
+				msg.Type.Protocol() != ipv6.ICMPTypeEchoRequest.Protocol() {
+				return
+			}
+			id := msg.Body.(*icmp.Echo).ID
+			flow := o.cache.Get(&net.IPAddr{IP: saddr.AsSlice()})
+			entry := [18]byte{}
+			copy(entry[:16], flow.Saddr.To16())
+			entry[16] = byte(id >> 8)
+			entry[17] = byte(id)
+			conntrack.Add([16]byte(flow.Daddr.To16()), entry)
+			if _, err := socket.WriteTo(pkt.ToView().AsSlice()[iphdrSize:], &net.UDPAddr{IP: flow.Daddr}); err != nil {
 				if checkErr(err) {
 					return
 				}
@@ -481,23 +494,90 @@ func (o *Ofutun) setupICMPTap() error {
 	}
 }
 
-func (o *Ofutun) writeICMP(dst [16]byte, src [16]byte, data []byte) error {
+func (o *Ofutun) handleICMP(data []byte, from net.Addr, conntrack *expirable.LRU[[16]byte, [18]byte]) error {
+	fromAddr := from.(*net.UDPAddr)
+	entry, ok := conntrack.Get([16]byte(fromAddr.IP.To16()))
+	if !ok {
+		return nil
+	}
+	dst := net.IP(entry[:16])
+	if dst.To4() != nil {
+		dst = dst.To4()
+	}
+	id := uint16(entry[16])<<8 | uint16(entry[17])
+	var trproto tcpip.TransportProtocolNumber
+	var nwproto tcpip.NetworkProtocolNumber
+	var psh []byte
+	if fromAddr.IP.To4() != nil && dst.To4() != nil {
+		trproto = header.ICMPv4ProtocolNumber
+		nwproto = header.IPv4ProtocolNumber
+	} else {
+		trproto = header.ICMPv6ProtocolNumber
+		nwproto = header.IPv6ProtocolNumber
+		psh = make([]byte, 40)
+		copy(psh, fromAddr.IP.To16())
+		copy(psh[16:], dst.To16())
+		binary.BigEndian.PutUint32(psh[32:], uint32(len(data)))
+		psh[39] = byte(trproto)
+	}
+	msg, err := icmp.ParseMessage(int(trproto), data)
+	if err != nil {
+		return fmt.Errorf("failed to parse ICMP message: %w", err)
+	}
+	if msg.Type.Protocol() != ipv4.ICMPTypeEchoReply.Protocol() &&
+		msg.Type.Protocol() != ipv6.ICMPTypeEchoReply.Protocol() {
+		return nil
+	}
+	echo := msg.Body.(*icmp.Echo)
+	echo.ID = int(id)
+	msg.Body = echo
+	pkt, err := msg.Marshal(psh)
+	if err != nil {
+		return fmt.Errorf("failed to marshal ICMP message: %w", err)
+	}
+	if err := o.writeICMP(dst, fromAddr.IP, nwproto, pkt); err != nil {
+		return fmt.Errorf("failed to write ICMP message: %w", err)
+	}
+	return nil
+}
+
+func (o *Ofutun) writeICMP(dst net.IP, src net.IP, proto tcpip.NetworkProtocolNumber, data []byte) error {
+	var pkt []byte
+	if dst.To4() != nil && src.To4() != nil {
+		rnd := make([]byte, 2)
+		if _, err := rand.Read(rnd); err != nil {
+			return fmt.Errorf("failed to read random bytes: %w", err)
+		}
+		iph := make(header.IPv4, header.IPv4MinimumSize)
+		iph.Encode(&header.IPv4Fields{
+			TotalLength: uint16((len(data) + header.IPv4MinimumSize)),
+			Protocol:    uint8(header.ICMPv4ProtocolNumber),
+			ID:          uint16(rnd[0])<<8 | uint16(rnd[1]),
+			TTL:         64,
+			SrcAddr:     tcpip.AddrFromSlice(src),
+			DstAddr:     tcpip.AddrFromSlice(dst),
+		})
+		iph.SetChecksum(^iph.CalculateChecksum())
+		pkt = append(iph, data...)
+	} else {
+		iph := make(header.IPv6, header.IPv6MinimumSize)
+		iph.Encode(&header.IPv6Fields{
+			PayloadLength:     uint16(len(data)),
+			TransportProtocol: header.ICMPv6ProtocolNumber,
+			HopLimit:          255,
+			SrcAddr:           tcpip.AddrFromSlice(src),
+			DstAddr:           tcpip.AddrFromSlice(dst),
+		})
+		pkt = append(iph, data...)
+	}
 	var wq waiter.Queue
-	ep, terr := o.stack.NewPacketEndpoint(true, header.IPv4ProtocolNumber, &wq)
+	ep, terr := o.stack.NewPacketEndpoint(true, proto, &wq)
 	if terr != nil {
 		return errors.New(terr.String())
 	}
-	fmt.Println(hex.Dump(data))
 	var r bytes.Reader
-	r.Reset([]byte{
-		0x45, 0x00, 0x00, 0x01,
-		0x00, 0x00, 0x00, 0x00,
-		0x40, 0x01, 0x00, 0x00,
-		8, 8, 8, 8,
-		192, 168, 0, 2,
-		0x01,
-	})
-	if _, err := ep.Write(&r, tcpip.WriteOptions{}); err != nil {
+	r.Reset(pkt)
+	if _, err := ep.Write(&r, tcpip.WriteOptions{To: &tcpip.FullAddress{NIC: 1}}); err != nil {
 		return fmt.Errorf("failed to write to endpoint: %s", err.String())
 	}
 	defer ep.Close()
@@ -554,13 +634,10 @@ func (o *Ofutun) setupAnyUDP() error {
 		}
 		flow := o.cache.Get(saddr)
 		saddr16 := flow.Saddr.To16()
-		key := [18]byte{
-			saddr16[0], saddr16[1], saddr16[2], saddr16[3],
-			saddr16[4], saddr16[5], saddr16[6], saddr16[7],
-			saddr16[8], saddr16[9], saddr16[10], saddr16[11],
-			saddr16[12], saddr16[13], saddr16[14], saddr16[15],
-			byte(flow.Sport >> 8), byte(flow.Sport),
-		}
+		key := [18]byte{}
+		copy(key[:16], saddr16[:])
+		key[16] = byte(flow.Sport >> 8)
+		key[17] = byte(flow.Sport)
 		conn, ok := conns.Get(key)
 		if !ok {
 			target := net.JoinHostPort(flow.Daddr.String(), fmt.Sprintf("%d", flow.Dport))
