@@ -16,8 +16,8 @@
   - Built-in TCP/IP stack by [gvisor](https://gvisor.dev/)
   - Terminate tcp/udp connections in the ofutun, and Convert to tcp/udp stream from ofutun.
 - Convert HTTP/HTTPS proxy to transparent proxy.
-- icmp is not yet supported
-  - Currently only tcp/udp connections are supported.
+- ICMP support.
+  - `sysctl -w net.ipv4.ping_group_range="0 2147483647"` allows non-root users to send ICMP packets.
 
 ## Pattern
 
