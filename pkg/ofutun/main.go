@@ -16,6 +16,7 @@ import (
 	"net/netip"
 	"net/url"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/boombuler/barcode/qr"
@@ -246,6 +247,10 @@ func (o *Ofutun) Run() error {
 		go func() {
 			for {
 				if err := o.setupICMPTap(); err != nil {
+					if errors.Is(err, syscall.EACCES) {
+						o.log.Info("failed to setup ICMP socket. run `sudo sysctl -w net.ipv4.ping_group_range=\"0 2147483647\"` to allow non-root users to send ICMP packets.")
+						break
+					}
 					if o.closed {
 						return
 					}
