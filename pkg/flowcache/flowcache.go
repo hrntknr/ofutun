@@ -72,14 +72,12 @@ func (f *Flow) Dst() string {
 
 func key(proto uint8, addr net.IP, port uint16) [KeySize]byte {
 	addrb := addr.To16()
-	return [KeySize]byte{
-		byte(proto),
-		addrb[0], addrb[1], addrb[2], addrb[3],
-		addrb[4], addrb[5], addrb[6], addrb[7],
-		addrb[8], addrb[9], addrb[10], addrb[11],
-		addrb[12], addrb[13], addrb[14], addrb[15],
-		byte(port >> 8), byte(port),
-	}
+	ret := [KeySize]byte{}
+	ret[0] = proto
+	copy(ret[1:17], addrb)
+	ret[17] = byte(port >> 8)
+	ret[18] = byte(port)
+	return ret
 }
 
 func extractAddr(addr net.Addr) (proto uint8, ip net.IP, port uint16) {
