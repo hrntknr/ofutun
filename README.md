@@ -65,6 +65,7 @@ Application Options:
       --proxy-only      Only allow traffic to the proxy
       --http-ports=     List of HTTP ports to allow (default: 80)
       --https-ports=    List of HTTPS ports to allow (default: 443)
+      --use-sni         Connect to the proxy using SNI
 
 Help Options:
   -h, --help            Show this help message

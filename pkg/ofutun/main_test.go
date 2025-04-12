@@ -55,6 +55,7 @@ func TestHTTPWithProxy(t *testing.T) {
 		[]uint16{httpPort},
 		[]uint16{},
 		false,
+		false,
 	)
 	assert.Equal(t, err, nil)
 	defer o.Close()
@@ -106,6 +107,7 @@ func TestHTTPSWithProxy(t *testing.T) {
 		[]netip.Addr{},
 		[]uint16{},
 		[]uint16{httpsPort},
+		false,
 		false,
 	)
 	assert.Equal(t, err, nil)
@@ -165,6 +167,7 @@ func TestHTTPWithHTTPSProxy(t *testing.T) {
 		[]uint16{httpPort},
 		[]uint16{},
 		false,
+		false,
 	)
 	assert.Equal(t, err, nil)
 	defer o.Close()
@@ -217,6 +220,7 @@ func TestHTTPWithProxyAuth(t *testing.T) {
 		[]uint16{httpPort},
 		[]uint16{},
 		false,
+		false,
 	)
 	assert.Equal(t, err, nil)
 	defer o.Close()
@@ -267,6 +271,7 @@ func TestHTTPNoProxy(t *testing.T) {
 		[]uint16{httpPort},
 		[]uint16{},
 		false,
+		false,
 	)
 	assert.Equal(t, err, nil)
 	defer o.Close()
@@ -316,6 +321,7 @@ func TestHTTPSWithProxyNoSNI(t *testing.T) {
 		[]netip.Addr{},
 		[]uint16{},
 		[]uint16{httpsPort},
+		false,
 		false,
 	)
 	assert.Equal(t, err, nil)
@@ -372,6 +378,7 @@ func TestTCP(t *testing.T) {
 		[]uint16{},
 		[]uint16{},
 		false,
+		false,
 	)
 	assert.Equal(t, err, nil)
 	defer o.Close()
@@ -405,6 +412,7 @@ func TestUDP(t *testing.T) {
 		[]netip.Addr{},
 		[]uint16{},
 		[]uint16{},
+		false,
 		false,
 	)
 	assert.Equal(t, err, nil)
@@ -440,6 +448,7 @@ func TestTCPIPv6(t *testing.T) {
 		[]uint16{},
 		[]uint16{},
 		false,
+		false,
 	)
 	assert.Equal(t, err, nil)
 	defer o.Close()
@@ -473,6 +482,7 @@ func TestUDPIPv6(t *testing.T) {
 		[]netip.Addr{},
 		[]uint16{},
 		[]uint16{},
+		false,
 		false,
 	)
 	assert.Equal(t, err, nil)
