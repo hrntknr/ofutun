@@ -36,6 +36,7 @@ var opts struct {
 	ProxyOnly     bool     `long:"proxy-only" description:"Only allow traffic to the proxy"`
 	HTTPPorts     []uint16 `long:"http-ports" description:"List of HTTP ports to allow" default:"80"`
 	HTTPSPorts    []uint16 `long:"https-ports" description:"List of HTTPS ports to allow" default:"443"`
+	UseSNI        bool     `long:"use-sni" description:"Connect to the proxy using SNI"`
 }
 
 func main() {
@@ -186,6 +187,7 @@ func run() error {
 		opts.HTTPPorts,
 		opts.HTTPSPorts,
 		opts.ProxyOnly,
+		opts.UseSNI,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to create instance: %w", err)

@@ -32,7 +32,6 @@ import (
 	"golang.org/x/net/ipv6"
 	"golang.zx2c4.com/wireguard/device"
 
-	// "golang.zx2c4.com/wireguard/tun/netstack"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
@@ -140,6 +139,7 @@ type Ofutun struct {
 	httpPort      []uint16
 	httpsPort     []uint16
 	proxyOnly     bool
+	useSNI        bool
 	closed        bool
 	closers       []io.Closer
 }
@@ -156,6 +156,7 @@ func NewOfutun(
 	httpPort []uint16,
 	httpsPort []uint16,
 	ProxyOnly bool,
+	useSNI bool,
 ) (*Ofutun, error) {
 	cache, err := flowcache.NewFlowCache()
 	if err != nil {
@@ -198,6 +199,7 @@ func NewOfutun(
 		httpPort:      httpPort,
 		httpsPort:     httpsPort,
 		proxyOnly:     ProxyOnly,
+		useSNI:        useSNI,
 		closed:        false,
 		closers:       []io.Closer{},
 	}, nil
@@ -232,7 +234,7 @@ func (o *Ofutun) Run() error {
 		for _, port := range o.httpsPort {
 			go func(p uint16) {
 				for {
-					if err := o.setupHTTPS(port); err != nil {
+					if err := o.setupHTTPS(port, o.useSNI); err != nil {
 						if o.closed {
 							return
 						}
@@ -301,7 +303,6 @@ func (o *Ofutun) setupHTTP(port uint16) error {
 		}
 		go func(c net.Conn) {
 			defer c.Close()
-			flow := o.cache.Get(conn.RemoteAddr())
 			req, err := http.ReadRequest(bufio.NewReader(c))
 			if err != nil {
 				o.log.Warn("failed to read request", zap.Error(err))
@@ -312,7 +313,6 @@ func (o *Ofutun) setupHTTP(port uint16) error {
 				o.log.Warn("failed to dial upstream", zap.Error(err))
 				return
 			}
-			req.URL.Host = flow.Dst()
 			req.URL.Opaque = "http://" + req.Host + req.URL.Path
 			for k, v := range header {
 				for _, vv := range v {
@@ -334,7 +334,7 @@ func (o *Ofutun) setupHTTP(port uint16) error {
 	}
 }
 
-func (o *Ofutun) setupHTTPS(port uint16) error {
+func (o *Ofutun) setupHTTPS(port uint16, useSNI bool) error {
 	httpsListener, err := o.net.ListenTCP(&net.TCPAddr{Port: int(port)})
 	if err != nil {
 		return err
@@ -364,8 +364,19 @@ func (o *Ofutun) setupHTTPS(port uint16) error {
 				o.log.Warn("failed to create request", zap.Error(err))
 				return
 			}
-			req.URL.Opaque = flow.Dst()
-			req.Host = flow.Dst()
+			if useSNI {
+				host := tlsConn.Host()
+				if host == "" {
+					host = flow.Daddr.String()
+				}
+				target := net.JoinHostPort(host, fmt.Sprintf("%d", port))
+				req.URL.Opaque = target
+				req.Host = target
+			} else {
+				target := flow.Dst()
+				req.URL.Opaque = target
+				req.Host = target
+			}
 			for k, v := range header {
 				for _, vv := range v {
 					req.Header.Add(k, vv)
@@ -638,6 +649,10 @@ func (o *Ofutun) setupAnyUDP() error {
 			return fmt.Errorf("failed to read from UDP: %w", err)
 		}
 		flow := o.cache.Get(saddr)
+		if flow == nil {
+			o.log.Warn("failed to get flow from cache", zap.String("saddr", saddr.String()))
+			continue
+		}
 		saddr16 := flow.Saddr.To16()
 		key := [18]byte{}
 		copy(key[:16], saddr16[:])
